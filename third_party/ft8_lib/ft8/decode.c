@@ -513,7 +513,11 @@ static void ft8_decode_multi_symbols(const WF_ELEM_T* wf, int num_bins, int n_sy
     const int n_bits = 3 * n_syms;
     const int n_tones = (1 << n_bits);
 
-    float s2[n_tones];
+    // Fixed-size buffer instead of a VLA (MSVC has no C99 VLAs).
+    // Callers pass n_syms <= 3, i.e. at most 8^3 = 512 tone combinations.
+    float s2[512];
+    if (n_tones > 512)
+        return;
 
     for (int j = 0; j < n_tones; ++j)
     {

@@ -136,11 +136,19 @@ void monitor_process(monitor_t* me, const float* frame)
     int offset = me->wf.num_blocks * me->wf.block_stride;
     int frame_pos = 0;
 
+    // Heap buffers instead of VLAs (MSVC has no C99 VLAs).
+    kiss_fft_scalar* timedata = (kiss_fft_scalar*)malloc(sizeof(kiss_fft_scalar) * me->nfft);
+    kiss_fft_cpx* freqdata = (kiss_fft_cpx*)malloc(sizeof(kiss_fft_cpx) * (me->nfft / 2 + 1));
+    if (!timedata || !freqdata)
+    {
+        free(timedata);
+        free(freqdata);
+        return;
+    }
+
     // Loop over block subdivisions
     for (int time_sub = 0; time_sub < me->wf.time_osr; ++time_sub)
     {
-        kiss_fft_scalar timedata[me->nfft];
-        kiss_fft_cpx freqdata[me->nfft / 2 + 1];
 
         // Shift the new data into analysis frame
         for (int pos = 0; pos < me->nfft - me->subblock_size; ++pos)
@@ -188,6 +196,8 @@ void monitor_process(monitor_t* me, const float* frame)
         }
     }
 
+    free(timedata);
+    free(freqdata);
     ++me->wf.num_blocks;
 }
 
