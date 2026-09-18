@@ -3,6 +3,62 @@
 All notable changes to AetherSDR are documented in this file.
 Format follows [Keep a Changelog](https://keepachangelog.com/).
 
+## [v0.9.0] — 2026-09-17
+
+### Station integration, logging, scanning, recording and Windows DAX
+
+### Features
+
+**SmartSDR-compatible CAT (Kenwood TS-2000 + Flex ZZ)**
+- TCP ports from 5002 and virtual serial ports (/tmp/AetherSDR-KCAT-A..H),
+  per-port slice binding, auto-information, split and TX-slice handling.
+
+**WSJT-X / JTDX UDP link**
+- Decodes become panadapter spots; clicking a spot asks WSJT-X to reply.
+- Logged QSOs flow into the new logbook; optional DXCC highlight and relay.
+
+**Logbook, uploads and contest aids**
+- SQLite logbook with ADIF 3.1.4 import/export and QSO recording links.
+- LoTW (TQSL), QRZ, Club Log and eQSL uploads with retry queue.
+- Contest profiles (CQ WW, ARRL DX, Field Day, NAQP, Sprint, custom),
+  dupe checking, multipliers, band-map spot labels, F1-F8 macros, SO2R.
+
+**Scanner**
+- Memory, band and frequency-list scanning with signal/squelch stop,
+  dwell, resume modes, skip list and priority channel. Stop restores the
+  slice and panadapter.
+
+**Recording**
+- Waterfall/spectrum recording with 1-8x playback into the panadapter.
+- DAX IQ recording to WAV/RF64 with auxi metadata; IQ files can be
+  reviewed as a waterfall.
+
+**CW**
+- Client-side Ultimatic, Bug and Straight paddle keyer modes (#416).
+- CW skimmer across a DAX IQ stream with callsign spotting.
+
+**FreeDV**
+- RADE end-of-over callsign decode, FreeDV Reporter hide/show and synced
+  rx_report, and a low-latency resampler profile (~16 ms per stage).
+
+**Rotator control**
+- Hamlib rotctld, PstRotator and N1MM backends with a compass applet;
+  turn to spots and logbook entries (short/long path).
+
+**Audio**
+- Device-mapped DAX backend (VB-Cable and similar) for Windows (#87) and
+  as a macOS/Linux fallback.
+- Per-slice audio routing to extra output devices or DAX channels.
+
+### Fixes
+- Waterfall rendered as solid colour when a wide panadapter's tile started
+  below 0 Hz.
+- Weak-signal map placed cty.dat stations mirrored east/west.
+- Shutdown no longer warns about timers stopped from another thread.
+
+### Internal
+- MainWindow split into focused controllers under src/gui/mainwindow.
+
 ## [v0.8.19] — 2026-04-20
 
 ### Community contributions landfest + macOS MNR + quick memory actions

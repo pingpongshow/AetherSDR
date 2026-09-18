@@ -6,6 +6,17 @@ namespace AetherSDR {
 
 const std::vector<ReleaseEntry>& whatsNewEntries() {
     static const std::vector<ReleaseEntry> entries = {
+        {QStringLiteral("0.9.0"), QStringLiteral("2026-09-17"), QStringLiteral("Station integration, logging, scanning, recording and Windows DAX"), {
+            {ChangeCategory::Feature, QStringLiteral("SmartSDR-compatible CAT (Kenwood TS-2000 + Flex ZZ)"), QStringLiteral("TCP ports from 5002 and virtual serial ports (/tmp/AetherSDR-KCAT-A..H), per-port slice binding, auto-information, split and TX-slice handling.")},
+            {ChangeCategory::Feature, QStringLiteral("WSJT-X / JTDX UDP link"), QStringLiteral("Decodes become panadapter spots; clicking a spot asks WSJT-X to reply. Logged QSOs flow into the new logbook; optional DXCC highlight and relay.")},
+            {ChangeCategory::Feature, QStringLiteral("Logbook, uploads and contest aids"), QStringLiteral("SQLite logbook with ADIF 3.1.4 import/export and QSO recording links. LoTW (TQSL), QRZ, Club Log and eQSL uploads with retry queue. Contest profiles (CQ WW, ARRL DX, Field Day, NAQP, Sprint, custom...")},
+            {ChangeCategory::Feature, QStringLiteral("Scanner"), QStringLiteral("Memory, band and frequency-list scanning with signal/squelch stop, dwell, resume modes, skip list and priority channel. Stop restores the slice and panadapter.")},
+            {ChangeCategory::Feature, QStringLiteral("Recording"), QStringLiteral("Waterfall/spectrum recording with 1-8x playback into the panadapter. DAX IQ recording to WAV/RF64 with auxi metadata; IQ files can be reviewed as a waterfall.")},
+            {ChangeCategory::Feature, QStringLiteral("CW"), QStringLiteral("Client-side Ultimatic, Bug and Straight paddle keyer modes (#416). CW skimmer across a DAX IQ stream with callsign spotting.")},
+            {ChangeCategory::Feature, QStringLiteral("FreeDV"), QStringLiteral("RADE end-of-over callsign decode, FreeDV Reporter hide/show and synced rx_report, and a low-latency resampler profile (~16 ms per stage).")},
+            {ChangeCategory::Feature, QStringLiteral("Rotator control"), QStringLiteral("Hamlib rotctld, PstRotator and N1MM backends with a compass applet; turn to spots and logbook entries (short/long path).")},
+            {ChangeCategory::Feature, QStringLiteral("Audio"), QStringLiteral("Device-mapped DAX backend (VB-Cable and similar) for Windows (#87) and as a macOS/Linux fallback. Per-slice audio routing to extra output devices or DAX channels.")},
+        }},
         {QStringLiteral("0.8.19"), QStringLiteral("2026-04-20"), QStringLiteral("Community contributions landfest + macOS MNR + quick memory actions"), {
             {ChangeCategory::Feature, QStringLiteral("macOS MMSE-Wiener spectral noise reduction (MNR) (#1672, Chaosuk97)"), QStringLiteral("New macOS-exclusive client-side NR mode accelerated via Apple Accelerate (vDSP / AMX on Apple Silicon).  Decision-directed MMSE-Wiener filter with 25-frame minimum-statistics noise-floor tracking. ...")},
             {ChangeCategory::Feature, QStringLiteral("PooDoo™ TX Reverb (#1741) — carried forward, chain now complete"), QStringLiteral("Already shipped in v0.8.18 final release notes; listed here for completeness since it rolls into the 0.8.19 post-release chain view.")},
