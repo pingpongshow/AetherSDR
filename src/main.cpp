@@ -1,0 +1,203 @@
+#ifdef AETHER_GUI_TEST
+#include "testing/GuiTestServer.h"
+#include <memory>
+#endif
+#include "gui/MainWindow.h"
+#include "core/AppSettings.h"
+#include "core/LogManager.h"
+#include "core/MacMicPermission.h"
+
+#include <QApplication>
+#include <QSurfaceFormat>
+#include <QStyleFactory>
+#include <QDir>
+#include <QDebug>
+#include <QFile>
+#include <QDateTime>
+#include <QTextStream>
+#include <QStandardPaths>
+#include <QRegularExpression>
+
+static QFile* s_logFile = nullptr;
+
+// Redact PII from log messages before writing to file.
+// Patterns: IP addresses, radio serial numbers, Auth0 tokens, MAC addresses.
+//
+// Regex objects are heap-allocated (intentional leak) so they survive static
+// destruction order during abnormal teardown.  Without this, crash cleanup
+// invokes the message handler from dying threads after the function-local
+// statics are destroyed, producing "invalid QRegularExpression" errors (#1233).
+static QString redactPii(const QString& msg)
+{
+    QString out = msg;
+
+    // IPv4 addresses: 192.168.50.121 → *.*.*. 121 (keep last octet)
+    static const QRegularExpression* ipRe = new QRegularExpression(
+        R"((\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3}))");
+    out.replace(*ipRe, QStringLiteral("*.*.*. \\4"));
+
+    // Radio serial: 4424-1213-8600-7836 → ****-****-****-7836
+    static const QRegularExpression* serialRe = new QRegularExpression(
+        R"(\d{4}-\d{4}-\d{4}-(\d{4}))");
+    out.replace(*serialRe, QStringLiteral("****-****-****-\\1"));
+
+    // Auth0 tokens (long base64 strings after id_token or token)
+    static const QRegularExpression* tokenRe = new QRegularExpression(
+        R"((id_token[= :]|token[= :])\s*([A-Za-z0-9_\-\.]{20})[A-Za-z0-9_\-\.]+)");
+    out.replace(*tokenRe, QStringLiteral("\\1 \\2...REDACTED"));
+
+    // MAC addresses: 00-1C-2D-05-37-2A → **-**-**-**-**-2A
+    static const QRegularExpression* macRe = new QRegularExpression(
+        R"(([0-9A-Fa-f]{2})-([0-9A-Fa-f]{2})-([0-9A-Fa-f]{2})-([0-9A-Fa-f]{2})-([0-9A-Fa-f]{2})-([0-9A-Fa-f]{2}))");
+    out.replace(*macRe, QStringLiteral("**-**-**-**-**-\\6"));
+
+    return out;
+}
+
+static void messageHandler(QtMsgType type, const QMessageLogContext& ctx, const QString& msg)
+{
+    Q_UNUSED(ctx);
+    static const char* labels[] = {"DBG", "WRN", "CRT", "FTL", "INF"};
+    const char* label = (type <= QtInfoMsg) ? labels[type] : "???";
+
+    const QString safeMsg = redactPii(msg);
+    const QString line = QString("[%1] %2: %3\n")
+        .arg(QDateTime::currentDateTime().toString("HH:mm:ss.zzz"), label, safeMsg);
+
+    // Write to log file (PII-redacted)
+    if (s_logFile && s_logFile->isOpen()) {
+        QTextStream ts(s_logFile);
+        ts << line;
+        ts.flush();
+    }
+    // Also print to stderr (PII-redacted)
+    fprintf(stderr, "%s", line.toLocal8Bit().constData());
+}
+
+int main(int argc, char* argv[])
+{
+    // ── Pre-QApplication environment setup ────────────────────────────────
+
+    // AETHER_NO_GPU: runtime toggle to force software OpenGL rendering.
+    // Unlike the compile-time AETHER_GPU_SPECTRUM CMake flag, this works on
+    // already-built binaries. Avoids hardware GLX/EGL entirely.
+    if (qEnvironmentVariableIsSet("AETHER_NO_GPU")) {
+        qputenv("QT_OPENGL", "software");
+    }
+
+    // Prefer native Wayland when running under a Wayland session (#1233).
+    // Without this, Qt may fall back to XWayland (xcb platform) where GLX
+    // context switching between the main window and child dialogs triggers
+    // a BadAccess crash (X_GLXMakeCurrent) on some compositors.
+    // Only set when QT_QPA_PLATFORM isn't already configured by the user.
+    // Skip for AppImage: the bundled Qt Wayland plugin may not match the
+    // host compositor's protocol version, causing an abort on init (#1389).
+    if (!qEnvironmentVariableIsSet("QT_QPA_PLATFORM")
+            && !qEnvironmentVariableIsSet("APPIMAGE")) {
+        const QByteArray session = qgetenv("XDG_SESSION_TYPE");
+        if (session == "wayland" && qEnvironmentVariableIsSet("WAYLAND_DISPLAY")) {
+            qputenv("QT_QPA_PLATFORM", "wayland");
+        }
+    }
+
+    // Apply saved UI scale factor BEFORE QApplication is created.
+    // QT_SCALE_FACTOR must be set before Qt initializes the display.
+    // We read the settings file directly (can't use AppSettings or
+    // QStandardPaths before QApplication exists).
+    {
+#ifdef Q_OS_MAC
+        QString settingsPath = QDir::homePath() + "/Library/Preferences/AetherSDR/AetherSDR.settings";
+#else
+        QString settingsPath = QDir::homePath() + "/.config/AetherSDR/AetherSDR.settings";
+#endif
+        QFile f(settingsPath);
+        if (f.open(QIODevice::ReadOnly | QIODevice::Text)) {
+            QByteArray data = f.readAll();
+            // AppSettings XML format: <UiScalePercent>125</UiScalePercent>
+            QByteArray tag = "<UiScalePercent>";
+            int idx = data.indexOf(tag);
+            if (idx >= 0) {
+                idx += tag.size();
+                int end = data.indexOf('<', idx);
+                if (end > idx) {
+                    int pct = data.mid(idx, end - idx).trimmed().toInt();
+                    if (pct > 0 && pct != 100)
+                        qputenv("QT_SCALE_FACTOR", QByteArray::number(pct / 100.0, 'f', 2));
+                }
+            }
+        }
+    }
+
+    QApplication app(argc, argv);
+    app.setApplicationName("AetherSDR");
+    app.setApplicationVersion(AETHERSDR_VERSION);
+    app.setOrganizationName("AetherSDR");
+    app.setDesktopFileName("AetherSDR");  // matches .desktop file for taskbar icon
+
+    // Request microphone permission early (macOS only).
+    // Shows the system prompt on first launch so it's ready before PTT.
+    requestMicrophonePermission();
+
+    // Set up file logging in ~/.config/AetherSDR/ (works inside AppImage where
+    // applicationDirPath() is read-only).
+    // Use GenericConfigLocation + app name to avoid the double-nested
+    // ~/.config/AetherSDR/AetherSDR/ path that AppConfigLocation produces.
+    const QString logDir = QStandardPaths::writableLocation(QStandardPaths::GenericConfigLocation)
+                           + "/AetherSDR";
+    QDir().mkpath(logDir);
+
+    // Timestamped log file — keep last 5 sessions
+    const QString timestamp = QDateTime::currentDateTime().toString("yyyyMMdd-HHmmss");
+    const QString logPath = logDir + "/aethersdr-" + timestamp + ".log";
+
+    // Prune old log files (keep newest 4 + the one we're about to create = 5)
+    {
+        QDir dir(logDir);
+        QStringList logs = dir.entryList({"aethersdr-*.log"}, QDir::Files, QDir::Name);
+        while (logs.size() >= 5) {
+            dir.remove(logs.takeFirst());
+        }
+    }
+
+    s_logFile = new QFile(logPath);
+    if (s_logFile->open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) {
+        // Restrict log file to owner-only (may contain session identifiers)
+        s_logFile->setPermissions(QFileDevice::ReadOwner | QFileDevice::WriteOwner);
+        qInstallMessageHandler(messageHandler);
+
+        // Symlink aethersdr.log → latest timestamped file (for Support dialog)
+        const QString symlink = logDir + "/aethersdr.log";
+        QFile::remove(symlink);
+        QFile::link(logPath, symlink);
+    } else {
+        fprintf(stderr, "Warning: could not open log file %s\n", logPath.toLocal8Bit().constData());
+        delete s_logFile;
+        s_logFile = nullptr;
+    }
+
+    // Use Fusion style as a clean cross-platform base
+    // (our dark theme overrides colors via stylesheet)
+    app.setStyle(QStyleFactory::create("Fusion"));
+
+    // Load XML settings (auto-migrates from QSettings on first run)
+    AetherSDR::AppSettings::instance().load();
+
+    // Load per-module logging toggles (must be after AppSettings::load)
+    AetherSDR::LogManager::instance().loadSettings();
+
+    qDebug() << "Starting AetherSDR" << app.applicationVersion();
+
+    AetherSDR::MainWindow window;
+    window.show();
+
+#ifdef AETHER_GUI_TEST
+    // Developer GUI automation (see src/testing/GuiTestServer.h).
+    std::unique_ptr<AetherSDR::GuiTestServer> guiTestServer;
+    if (const QByteArray port = qgetenv("AETHER_GUI_TEST_PORT"); !port.isEmpty()) {
+        guiTestServer = std::make_unique<AetherSDR::GuiTestServer>(
+            static_cast<quint16>(port.toUShort()));
+    }
+#endif
+
+    return app.exec();
+}

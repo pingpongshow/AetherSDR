@@ -1,0 +1,379 @@
+#include "RadioConnection.h"
+#include "LogManager.h"
+
+#include <QNetworkInterface>
+#ifdef AETHER_GUI_TEST
+#include "testing/TxSafety.h"
+#endif
+
+#ifdef Q_OS_LINUX
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#elif defined(Q_OS_MACOS)
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <sys/socket.h>
+#elif defined(Q_OS_WIN)
+#include <winsock2.h>
+#include <ws2tcpip.h>
+#include <mstcpip.h>
+// MinGW headers may lack TCP_INFO_v0 / SIO_TCP_INFO (Windows 10 1703+)
+#ifndef SIO_TCP_INFO
+#define SIO_TCP_INFO _WSAIORW(IOC_VENDOR, 39)
+typedef struct _TCP_INFO_v0 {
+    ULONG    State;  // TCPSTATE enum — not used, just padding
+    ULONG    Mss;
+    ULONG64  ConnectionTimeMs;
+    BOOLEAN  TimestampsEnabled;
+    ULONG    RttUs;
+    ULONG    MinRttUs;
+    ULONG    BytesInFlight;
+    ULONG    Cwnd;
+    ULONG    SndWnd;
+    ULONG    RcvWnd;
+    ULONG    RcvBuf;
+    ULONG64  BytesOut;
+    ULONG64  BytesIn;
+    ULONG    BytesReordered;
+    ULONG    BytesRetrans;
+    ULONG    FastRetrans;
+    ULONG    DupAcksIn;
+    ULONG    TimeoutEpisodes;
+    UCHAR    SynRetrans;
+} TCP_INFO_v0;
+#endif
+#endif
+
+namespace AetherSDR {
+
+static constexpr int HEARTBEAT_INTERVAL_MS = 30000;
+
+RadioConnection::RadioConnection(QObject* parent)
+    : QObject(parent)
+{
+}
+
+RadioConnection::~RadioConnection()
+{
+    disconnectFromRadio();
+}
+
+void RadioConnection::init()
+{
+    m_socket = new QTcpSocket(this);
+    m_heartbeat = new QTimer(this);
+
+    connect(m_socket, &QTcpSocket::connected,
+            this, &RadioConnection::onSocketConnected);
+    connect(m_socket, &QTcpSocket::disconnected,
+            this, &RadioConnection::onSocketDisconnected);
+    connect(m_socket, &QTcpSocket::readyRead,
+            this, &RadioConnection::onReadyRead);
+    connect(m_socket, &QAbstractSocket::errorOccurred,
+            this, &RadioConnection::onSocketError);
+
+    m_heartbeat->setInterval(HEARTBEAT_INTERVAL_MS);
+    connect(m_heartbeat, &QTimer::timeout, this, &RadioConnection::onHeartbeat);
+}
+
+void RadioConnection::connectToRadio(const RadioInfo& info)
+{
+    connectToHost(info.address, info.port,
+                  info.bindSettings.mode,
+                  info.bindSettings.bindAddress,
+                  info.sessionBindAddress);
+}
+
+void RadioConnection::connectToHost(const QHostAddress& address,
+                                    quint16 port,
+                                    RadioBindMode bindMode,
+                                    const QHostAddress& explicitBindAddr,
+                                    const QHostAddress& sessionBindAddr)
+{
+    if (m_state.load() != ConnectionState::Disconnected) return;
+    if (!m_socket) { qCWarning(lcConnection) << "RadioConnection: init() not called"; return; }
+
+    m_bindMode = bindMode;
+    m_explicitBindAddr = explicitBindAddr;
+    m_sessionBindAddr = sessionBindAddr;
+    m_radioAddr = address;
+    m_localAddr = QHostAddress();
+    m_localPort = 0;
+    m_readBuffer.clear();   // drop any partial line left by a dropped session
+    m_lastPingSeq = 0;
+    m_socket->abort();
+
+    QHostAddress preferredBindAddr =
+        (bindMode == RadioBindMode::Explicit) ? explicitBindAddr : sessionBindAddr;
+    if (bindMode != RadioBindMode::Explicit && preferredBindAddr.isNull()) {
+        // Auto mode with no remembered source: prefer a physical interface on
+        // the radio's own subnet. VPNs (e.g. Tailscale subnet routes) can
+        // otherwise capture the route, so the radio sees a NATed client IP and
+        // its VITA-49 UDP stream / file-transfer callbacks never reach us.
+        preferredBindAddr = sameSubnetLocalAddress(address);
+        if (!preferredBindAddr.isNull()) {
+            qCDebug(lcConnection) << "RadioConnection: auto-selected same-subnet source"
+                                  << preferredBindAddr.toString();
+        }
+    }
+    const bool shouldBind =
+        !preferredBindAddr.isNull() &&
+        preferredBindAddr.protocol() == QAbstractSocket::IPv4Protocol;
+
+    if (shouldBind) {
+        if (!m_socket->bind(preferredBindAddr, 0)) {
+            const QString msg = QStringLiteral("Failed to bind local TCP source address %1: %2")
+                                    .arg(preferredBindAddr.toString(), m_socket->errorString());
+            if (bindMode == RadioBindMode::Explicit) {
+                qCWarning(lcConnection) << "RadioConnection:" << msg;
+                m_socket->abort();
+                m_socket->close();
+                // Stay Disconnected so the user can fix the bind address and retry.
+                setState(ConnectionState::Disconnected);
+                emit errorOccurred(msg);
+                return;
+            }
+
+            qCDebug(lcConnection) << "RadioConnection: auto bind to"
+                                  << preferredBindAddr.toString()
+                                  << "failed, falling back to OS routing:"
+                                  << m_socket->errorString();
+        } else {
+            qCDebug(lcConnection) << "RadioConnection: bound local TCP source to"
+                                  << preferredBindAddr.toString()
+                                  << ":" << m_socket->localPort()
+                                  << "(mode"
+                                  << (bindMode == RadioBindMode::Explicit ? "Explicit" : "Auto")
+                                  << ")";
+        }
+    } else {
+        qCDebug(lcConnection) << "RadioConnection: no explicit local TCP bind, letting OS route"
+                              << "(mode"
+                              << (bindMode == RadioBindMode::Explicit ? "Explicit" : "Auto")
+                              << ")";
+    }
+
+    qCDebug(lcConnection) << "RadioConnection: connecting to" << address.toString() << ":" << port;
+    setState(ConnectionState::Connecting);
+    m_socket->connectToHost(address, port);
+}
+
+QHostAddress RadioConnection::sameSubnetLocalAddress(const QHostAddress& radio)
+{
+    if (radio.protocol() != QAbstractSocket::IPv4Protocol) {
+        return {};
+    }
+    const auto ifaces = QNetworkInterface::allInterfaces();
+    for (const QNetworkInterface& iface : ifaces) {
+        const auto flags = iface.flags();
+        if (!flags.testFlag(QNetworkInterface::IsUp) || !flags.testFlag(QNetworkInterface::IsRunning)
+            || flags.testFlag(QNetworkInterface::IsLoopBack)
+            || flags.testFlag(QNetworkInterface::IsPointToPoint)) {
+            continue;  // VPN tunnels (utun/tun) are point-to-point
+        }
+        for (const QNetworkAddressEntry& entry : iface.addressEntries()) {
+            const QHostAddress ip = entry.ip();
+            if (ip.protocol() != QAbstractSocket::IPv4Protocol || entry.prefixLength() <= 0
+                || entry.prefixLength() >= 32) {
+                continue;
+            }
+            if (radio.isInSubnet(ip, entry.prefixLength())) {
+                return ip;
+            }
+        }
+    }
+    return {};
+}
+
+void RadioConnection::disconnectFromRadio()
+{
+    if (m_heartbeat) m_heartbeat->stop();
+    if (m_socket && m_socket->state() != QAbstractSocket::UnconnectedState)
+        m_socket->disconnectFromHost();
+    m_handle = 0;
+}
+
+void RadioConnection::gracefulDisconnect(quint32 handle, const QString& rxStreamId)
+{
+    if (!m_socket || m_socket->state() == QAbstractSocket::UnconnectedState) {
+        disconnectFromRadio();
+        return;
+    }
+
+    // Send stream remove + client disconnect before closing TCP so the radio
+    // tears down our session cleanly. Without this the Maestro can lock up
+    // when reconnecting with the same GUIClientID. (#1359)
+    if (!rxStreamId.isEmpty()) {
+        QString cmd = QString("C0|stream remove 0x%1\n").arg(rxStreamId);
+        m_socket->write(cmd.toUtf8());
+    }
+    QString cmd = QString("C0|client disconnect handle=0x%1\n").arg(handle, 0, 16);
+    m_socket->write(cmd.toUtf8());
+    m_socket->flush();
+    m_socket->waitForBytesWritten(500);
+
+    disconnectFromRadio();
+}
+
+void RadioConnection::writeCommand(quint32 seq, const QString& command)
+{
+    if (!isConnected() || !m_socket) return;
+#ifdef AETHER_GUI_TEST
+    if (TxSafety::isTransmitCommand(command)) {
+        qCWarning(lcConnection) << "TX INTERLOCK (GUI test build): blocked" << command;
+        return;
+    }
+#endif
+
+    const QByteArray data = CommandParser::buildCommand(seq, command);
+    if (command.startsWith("ping")) {
+        m_lastPingSeq = seq;
+        m_pingStopwatch.restart();  // fallback timer in case TCP_INFO unavailable
+    } else {
+        qCDebug(lcConnection) << "TX:" << data.trimmed();
+    }
+    m_socket->write(data);
+    m_socket->flush();   // force immediate kernel send for keepalive reliability
+}
+
+void RadioConnection::onSocketConnected()
+{
+    qCDebug(lcConnection) << "RadioConnection: TCP connected";
+    m_socket->setSocketOption(QAbstractSocket::LowDelayOption, 1);
+    m_radioAddr = m_socket->peerAddress();
+    m_localAddr = m_socket->localAddress();
+    m_localPort = m_socket->localPort();
+    qCDebug(lcConnection) << "RadioConnection: local TCP endpoint"
+                          << m_localAddr.toString() << ":" << m_localPort;
+    qCDebug(lcConnection) << "RTT method:" << (kernelRttMs() >= 0 ? "kernel TCP_INFO" : "QElapsedTimer fallback");
+}
+
+void RadioConnection::onSocketDisconnected()
+{
+    qCDebug(lcConnection) << "RadioConnection: TCP disconnected";
+    if (m_heartbeat) m_heartbeat->stop();
+    m_localAddr = QHostAddress();
+    m_localPort = 0;
+    setState(ConnectionState::Disconnected);
+    emit disconnected();
+}
+
+void RadioConnection::onSocketError(QAbstractSocket::SocketError)
+{
+    if (!m_socket) return;
+    const QString msg = m_socket->errorString();
+    qCWarning(lcConnection) << "RadioConnection: socket error:" << msg;
+    // A failed connect attempt (refused, unreachable, timeout) never reaches
+    // Connected, so Qt emits errorOccurred but NOT disconnected(). Leaving the
+    // state at Error would make connectToHost() ignore every later attempt —
+    // both manual connects and the auto-reconnect backoff.
+    if (m_socket->state() == QAbstractSocket::UnconnectedState
+        && m_state.load() != ConnectionState::Connected) {
+        m_readBuffer.clear();
+        setState(ConnectionState::Disconnected);
+    } else {
+        setState(ConnectionState::Error);
+    }
+    emit errorOccurred(msg);
+}
+
+void RadioConnection::onReadyRead()
+{
+    if (!m_socket) return;
+    m_readBuffer.append(m_socket->readAll());
+    int newlinePos;
+    while ((newlinePos = m_readBuffer.indexOf('\n')) >= 0) {
+        const QString line = QString::fromUtf8(m_readBuffer.left(newlinePos)).trimmed();
+        m_readBuffer.remove(0, newlinePos + 1);
+        if (!line.isEmpty())
+            processLine(line);
+    }
+}
+
+void RadioConnection::onHeartbeat()
+{
+}
+
+void RadioConnection::processLine(const QString& line)
+{
+    const bool isGps = line.contains("|gps ");
+    bool isPingReply = false;
+    if (m_lastPingSeq && line.startsWith("R")) {
+        isPingReply = line.startsWith(QString("R%1|").arg(m_lastPingSeq));
+        if (isPingReply) {
+            int rtt = kernelRttMs();
+            if (rtt < 0)
+                rtt = static_cast<int>(m_pingStopwatch.elapsed());  // fallback
+            emit pingRttMeasured(rtt);
+            m_lastPingSeq = 0;
+        }
+    }
+    if (!isGps && !isPingReply)
+        qCDebug(lcConnection) << "RX:" << line;
+
+    ParsedMessage msg = CommandParser::parseLine(line);
+    emit messageReceived(msg);
+
+    switch (msg.type) {
+    case MessageType::Version:
+        emit versionReceived(msg.object);
+        break;
+    case MessageType::Handle:
+        m_handle = msg.handle;
+        qCDebug(lcConnection) << "RadioConnection: assigned handle" << QString::number(m_handle, 16);
+        setState(ConnectionState::Connected);
+        if (m_heartbeat) m_heartbeat->start();
+        emit connected();
+        break;
+    case MessageType::Response:
+        emit commandResponse(msg.sequence, msg.resultCode, msg.object);
+        break;
+    case MessageType::Status:
+        emit statusReceived(msg.object, msg.kvs);
+        break;
+    default:
+        break;
+    }
+}
+
+// ─── Kernel-level TCP RTT ────────────────────────────────────────────────────
+// Read the smoothed RTT maintained by the kernel's TCP congestion control.
+// This is measured from TCP ACK round-trips at the kernel level, completely
+// independent of Qt event loop buffering or application-layer timing.
+
+int RadioConnection::kernelRttMs() const
+{
+    if (!m_socket) return -1;
+    const auto fd = m_socket->socketDescriptor();
+    if (fd == -1) return -1;
+
+#ifdef Q_OS_LINUX
+    struct tcp_info info{};
+    socklen_t len = sizeof(info);
+    if (getsockopt(static_cast<int>(fd), IPPROTO_TCP, TCP_INFO, &info, &len) == 0)
+        return static_cast<int>(info.tcpi_rtt / 1000);  // µs → ms
+#elif defined(Q_OS_MACOS)
+    struct tcp_connection_info info{};
+    socklen_t len = sizeof(info);
+    if (getsockopt(static_cast<int>(fd), IPPROTO_TCP, TCP_CONNECTION_INFO, &info, &len) == 0)
+        return static_cast<int>(info.tcpi_srtt);  // already ms on macOS
+#elif defined(Q_OS_WIN)
+    TCP_INFO_v0 info{};
+    DWORD infoLen = sizeof(info);
+    DWORD version = 0;
+    if (WSAIoctl(static_cast<SOCKET>(fd), SIO_TCP_INFO, &version, sizeof(version),
+                 &info, sizeof(info), &infoLen, nullptr, nullptr) == 0)
+        return static_cast<int>(info.RttUs / 1000);  // µs → ms
+#endif
+
+    return -1;  // unsupported platform or call failed
+}
+
+void RadioConnection::setState(ConnectionState s)
+{
+    m_state.store(s);
+    emit stateChanged(s);
+}
+
+} // namespace AetherSDR

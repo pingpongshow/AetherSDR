@@ -1,0 +1,101 @@
+name: Windows Installer
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+
+      - name: Install Qt6
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.7.*'
+          host: 'windows'
+          target: 'desktop'
+          arch: 'win64_msvc2019_64'
+          modules: 'qtmultimedia qtserialport qtwebsockets qtshadertools'
+
+      - name: Install Ninja, Inno Setup, and LLVM
+        run: choco install ninja innosetup llvm -y
+
+      - name: Setup Opus (SmartLink audio codec)
+        run: .\setup-opus.ps1
+
+      - name: Setup FFTW3 float (NR4 dependency)
+        run: .\setup-fftw.ps1
+
+      - name: Setup hidapi (USB HID device support)
+        run: .\setup-hidapi.ps1
+
+      - name: Setup DeepFilterNet3 (DFNR)
+        run: .\setup-deepfilter.ps1
+
+      - name: Configure
+        run: |
+          cmake -B build -G "Ninja" -DCMAKE_BUILD_TYPE=Release -DENABLE_RADE=OFF -DMQTT_TLS=OFF
+
+      - name: Build
+        run: cmake --build build -j $env:NUMBER_OF_PROCESSORS
+
+      - name: Deploy Qt
+        run: |
+          mkdir deploy
+          copy build\AetherSDR.exe deploy\
+          windeployqt deploy\AetherSDR.exe --release --no-translations --no-system-d3d-compiler
+          if (Test-Path "third_party\fftw3\bin\libfftw3-3.dll") {
+            copy third_party\fftw3\bin\libfftw3-3.dll deploy\
+          }
+          if (Test-Path "third_party\fftw3\bin\libfftw3f-3.dll") {
+            copy third_party\fftw3\bin\libfftw3f-3.dll deploy\
+          }
+          if (Test-Path "third_party\hidapi\bin\hidapi.dll") {
+            copy third_party\hidapi\bin\hidapi.dll deploy\
+          }
+          if (Test-Path "third_party\deepfilter\lib\windows-x86_64\deepfilter.dll") {
+            copy third_party\deepfilter\lib\windows-x86_64\deepfilter.dll deploy\
+          }
+          if (Test-Path "third_party\deepfilter\models\DeepFilterNet3_onnx.tar.gz") {
+            copy third_party\deepfilter\models\DeepFilterNet3_onnx.tar.gz deploy\
+          }
+          # NOTE: MQTT TLS is disabled (-DMQTT_TLS=OFF) so no OpenSSL DLLs
+          # are needed. This avoids the "libssl-3-x64.dll not found" crash
+          # on systems without OpenSSL installed (#1341, #1362).
+          if ($false) {
+          }
+
+      - name: Create portable ZIP
+        run: |
+          Compress-Archive -Path deploy\* -DestinationPath "AetherSDR-${{ github.ref_name }}-Windows-x64-portable.zip"
+
+      - name: Create installer (Inno Setup)
+        run: |
+          $version = "${{ github.ref_name }}" -replace '^v', ''
+          & "C:\Program Files (x86)\Inno Setup 6\ISCC.exe" /DAPP_VERSION=$version packaging\windows\installer.iss
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: Windows-Installer
+          path: |
+            AetherSDR-*.zip
+            AetherSDR-*-setup.exe
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: |
+            AetherSDR-*.zip
+            AetherSDR-*-setup.exe

@@ -1,0 +1,75 @@
+#pragma once
+
+#include "core/ClientChainStages.h"
+
+#include <QWidget>
+
+class QPushButton;
+
+namespace AetherSDR {
+
+class AudioEngine;
+class ClientPudu;
+class ClientCompKnob;
+class PooDooLogo;
+
+// Floating editor for the PUDU exciter.  Same six knobs + A/B toggle
+// + logo as the docked applet, just at larger scale with dedicated
+// geometry persistence.  Keeps the cognitive load low — users don't
+// have to re-learn a separate UI in the floating window.
+class ClientPuduEditor : public QWidget {
+    Q_OBJECT
+
+public:
+    explicit ClientPuduEditor(AudioEngine* engine, QWidget* parent = nullptr);
+    ~ClientPuduEditor() override;
+
+    void showForTx();
+    // Rebinds the editor to the RX-chain instance and raises it.
+    void showForRx();
+    void showForPath(ClientChainPath path);
+    ClientChainPath path() const { return m_path; }
+
+signals:
+    void bypassToggled(bool bypassed);
+
+protected:
+    void closeEvent(QCloseEvent* ev) override;
+    void moveEvent(QMoveEvent* ev) override;
+    void resizeEvent(QResizeEvent* ev) override;
+    void showEvent(QShowEvent* ev) override;
+    void hideEvent(QHideEvent* ev) override;
+
+private:
+    void saveGeometryToSettings();
+    void restoreGeometryFromSettings();
+    void syncControlsFromEngine();
+
+    void onModeToggled(int id);
+    void applyPooDrive(float db);
+    void applyPooTune(float hz);
+    void applyPooMix(float v);
+    void applyDooTune(float hz);
+    void applyDooHarmonics(float db);
+    void applyDooMix(float v);
+
+    // DSP instance for the currently bound chain path (TX or RX).
+    ClientPudu* dsp() const;
+
+    AudioEngine*    m_audio{nullptr};
+    ClientChainPath m_path{ClientChainPath::Tx};
+    QString         m_baseTitle;
+    PooDooLogo*     m_logo{nullptr};
+    QPushButton*    m_bypass{nullptr};
+    QPushButton*    m_modeA{nullptr};
+    QPushButton*    m_modeB{nullptr};
+    ClientCompKnob* m_pooDrive{nullptr};
+    ClientCompKnob* m_pooTune{nullptr};
+    ClientCompKnob* m_pooMix{nullptr};
+    ClientCompKnob* m_dooTune{nullptr};
+    ClientCompKnob* m_dooHarmonics{nullptr};
+    ClientCompKnob* m_dooMix{nullptr};
+    bool            m_restoring{false};
+};
+
+} // namespace AetherSDR

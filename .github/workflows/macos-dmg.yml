@@ -1,0 +1,330 @@
+name: macOS DMG
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-dmg:
+    strategy:
+      matrix:
+        include:
+          - runner: macos-15
+            label: apple-silicon
+          - runner: macos-15-intel
+            label: intel
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          clean: false  # skip post-run cleanup — Intel Qt source build creates huge tree
+
+      - name: Install dependencies via Homebrew
+        run: |
+          brew install ninja create-dmg autoconf automake libtool \
+            fftw portaudio hidapi
+          if [ "${{ matrix.label }}" = "apple-silicon" ]; then
+            # Apple Silicon: Homebrew Qt targets current OS, fine for arm64
+            brew install qt@6 qtkeychain
+          else
+            # Intel: don't install Homebrew Qt — we build from source below.
+            # qtkeychain pulls in qt@6 as a dependency, so skip it too and
+            # build without SmartLink credential persistence on Intel.
+            brew install fftw portaudio hidapi
+          fi
+
+      - name: Restore Qt cache (Intel only)
+        if: matrix.label == 'intel'
+        id: qt-cache
+        uses: actions/cache@v5
+        with:
+          path: qt-install
+          key: qt-6.7.3-macos-intel-deploy13
+
+      - name: Build Qt from source (Intel only, cache miss)
+        if: matrix.label == 'intel' && steps.qt-cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --depth 1 --branch v6.7.3 https://code.qt.io/qt/qt5.git qt-src
+          cd qt-src
+          perl init-repository --module-subset=qtbase,qtmultimedia,qtwebsockets,qtserialport,qtshadertools
+          cd ..
+          mkdir qt-build && cd qt-build
+          ../qt-src/configure -prefix $PWD/../qt-install \
+            -release -opensource -confirm-license \
+            -nomake examples -nomake tests \
+            QMAKE_MACOSX_DEPLOYMENT_TARGET=13.0 \
+            -- -DCMAKE_OSX_DEPLOYMENT_TARGET=13.0
+          cmake --build . --parallel $(sysctl -n hw.ncpu)
+          cmake --install .
+
+      - name: Generate .icns from PNG
+        run: |
+          mkdir -p AetherSDR.iconset
+          sips -z 16 16     docs/logo-circle.png --out AetherSDR.iconset/icon_16x16.png
+          sips -z 32 32     docs/logo-circle.png --out AetherSDR.iconset/icon_16x16@2x.png
+          sips -z 32 32     docs/logo-circle.png --out AetherSDR.iconset/icon_32x32.png
+          sips -z 64 64     docs/logo-circle.png --out AetherSDR.iconset/icon_32x32@2x.png
+          sips -z 128 128   docs/logo-circle.png --out AetherSDR.iconset/icon_128x128.png
+          sips -z 256 256   docs/logo-circle.png --out AetherSDR.iconset/icon_128x128@2x.png
+          sips -z 256 256   docs/logo-circle.png --out AetherSDR.iconset/icon_256x256.png
+          sips -z 512 512   docs/logo-circle.png --out AetherSDR.iconset/icon_256x256@2x.png
+          sips -z 512 512   docs/logo-circle.png --out AetherSDR.iconset/icon_512x512.png
+          sips -z 768 768   docs/logo-circle.png --out AetherSDR.iconset/icon_512x512@2x.png
+          iconutil -c icns AetherSDR.iconset -o docs/AetherSDR.icns
+
+      - name: Setup DeepFilterNet3 (DFNR)
+        run: bash setup-deepfilter.sh
+
+      - name: Configure
+        run: |
+          if [ "${{ matrix.label }}" = "intel" ]; then
+            QT_PREFIX="$PWD/qt-install"
+            DEPLOY_TARGET="13.0"
+          else
+            QT_PREFIX="$(brew --prefix)"
+            DEPLOY_TARGET="14.0"
+          fi
+          # Intel Mac: disable GPU rendering — QRhiWidget has issues on
+          # older Metal/OpenGL hardware. Apple Silicon uses GPU by default.
+          GPU_FLAG=""
+          if [ "${{ matrix.label }}" = "intel" ]; then
+            GPU_FLAG="-DAETHER_GPU_SPECTRUM=OFF"
+          fi
+          cmake -B build -G "Unix Makefiles" \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="$DEPLOY_TARGET" \
+            -DCMAKE_PREFIX_PATH="$QT_PREFIX;$(brew --prefix)" \
+            -DMQTT_TLS=OFF \
+            $GPU_FLAG
+
+      - name: Build
+        run: cmake --build build -j$(sysctl -n hw.ncpu)
+
+      - name: Bundle DFNR model
+        run: |
+          if [ -f third_party/deepfilter/models/DeepFilterNet3_onnx.tar.gz ]; then
+            mkdir -p build/AetherSDR.app/Contents/Resources
+            cp third_party/deepfilter/models/DeepFilterNet3_onnx.tar.gz \
+              build/AetherSDR.app/Contents/Resources/
+          fi
+
+      - name: Build DAX audio driver
+        run: |
+          if [ "${{ matrix.label }}" = "intel" ]; then
+            DEPLOY_TARGET="13.0"
+          else
+            DEPLOY_TARGET="14.0"
+          fi
+          cmake -B driver-build hal-plugin \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_OSX_DEPLOYMENT_TARGET="$DEPLOY_TARGET"
+          cmake --build driver-build -j$(sysctl -n hw.ncpu)
+          DESTDIR="$PWD/driver-root" cmake --install driver-build
+
+      - name: Verify binaries
+        run: |
+          echo "=== App architecture check ==="
+          file build/AetherSDR.app/Contents/MacOS/AetherSDR
+          lipo -info build/AetherSDR.app/Contents/MacOS/AetherSDR
+          echo "=== DAX driver architecture check ==="
+          file driver-root/Library/Audio/Plug-Ins/HAL/AetherSDRDAX.driver/Contents/MacOS/AetherSDRDAX
+          lipo -info driver-root/Library/Audio/Plug-Ins/HAL/AetherSDRDAX.driver/Contents/MacOS/AetherSDRDAX
+
+      - name: Bundle Qt frameworks
+        run: |
+          if [ "${{ matrix.label }}" = "intel" ]; then
+            DEPLOYQT="$PWD/qt-install/bin/macdeployqt"
+          else
+            DEPLOYQT="$(brew --prefix qt@6)/bin/macdeployqt"
+          fi
+          "$DEPLOYQT" build/AetherSDR.app \
+            -verbose=1 \
+            -always-overwrite
+
+      - name: Import code signing certificate
+        env:
+          APPLE_CERT_BASE64: ${{ secrets.APPLE_CERT_BASE64 }}
+          APPLE_CERT_PASSWORD: ${{ secrets.APPLE_CERT_PASSWORD }}
+        run: |
+          security create-keychain -p "" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "" build.keychain
+          security set-keychain-settings build.keychain
+
+          # Application cert — for codesign (app, driver, DMG)
+          echo "$APPLE_CERT_BASE64" | base64 --decode > cert.p12
+          security import cert.p12 -k build.keychain -P "$APPLE_CERT_PASSWORD" \
+            -T /usr/bin/codesign -T /usr/bin/productsign
+          rm cert.p12
+
+          security set-key-partition-list -S apple-tool:,apple: -s -k "" build.keychain
+
+      - name: Code sign application
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          APP="build/AetherSDR.app"
+          SIGN_ID="Developer ID Application"
+
+          # 1. Sign all dylibs (plugins, helpers, etc.)
+          find "$APP" -name "*.dylib" -print0 | xargs -0 -n1 \
+            codesign --force --options runtime --timestamp --sign "$SIGN_ID"
+
+          # 2. Sign framework binaries (the actual Mach-O inside each .framework)
+          find "$APP/Contents/Frameworks" -name "*.framework" -type d -maxdepth 1 | while read fw; do
+            fw_name=$(basename "$fw" .framework)
+            fw_binary="$fw/$fw_name"
+            if [ -f "$fw_binary" ]; then
+              codesign --force --options runtime --timestamp --sign "$SIGN_ID" "$fw_binary"
+            fi
+            # Sign any nested dylibs inside the framework
+            find "$fw" -name "*.dylib" -print0 2>/dev/null | xargs -0 -n1 \
+              codesign --force --options runtime --timestamp --sign "$SIGN_ID" 2>/dev/null || true
+            # Sign the framework bundle itself
+            codesign --force --options runtime --timestamp --sign "$SIGN_ID" "$fw"
+          done
+
+          # 3. Sign the main app bundle last (no --deep)
+          codesign --force --options runtime --timestamp \
+            --entitlements macos/AetherSDR.entitlements \
+            --sign "$SIGN_ID" \
+            "$APP"
+
+          # 4. Verify
+          codesign --verify --deep --strict "$APP"
+          echo "Code signing verified successfully"
+
+      - name: Code sign DAX driver
+        run: |
+          codesign --force --options runtime --timestamp \
+            --sign "Developer ID Application" \
+            driver-root/Library/Audio/Plug-Ins/HAL/AetherSDRDAX.driver
+          codesign --verify --deep --strict \
+            driver-root/Library/Audio/Plug-Ins/HAL/AetherSDRDAX.driver
+          echo "DAX driver signing verified"
+
+      - name: Import installer certificate for PKG signing
+        env:
+          APPLE_INSTALLER_CERT_BASE64: ${{ secrets.APPLE_INSTALLER_CERT_BASE64 }}
+          APPLE_INSTALLER_CERT_PASSWORD: ${{ secrets.APPLE_INSTALLER_CERT_PASSWORD }}
+        run: |
+          echo "$APPLE_INSTALLER_CERT_BASE64" | base64 --decode > installer-cert.p12
+          security import installer-cert.p12 -k build.keychain -P "$APPLE_INSTALLER_CERT_PASSWORD" \
+            -T /usr/bin/productbuild -T /usr/bin/pkgbuild -T /usr/bin/productsign
+          rm installer-cert.p12
+          security set-key-partition-list -S apple-tool:,apple: -s -k "" build.keychain
+
+      - name: Build DAX driver PKG
+        run: |
+          # Extract version from CMakeLists.txt to keep driver PKG in sync
+          APP_VERSION=$(sed -n 's/^project(AetherSDR VERSION \([^ ]*\).*/\1/p' CMakeLists.txt)
+
+          # Component package (unsigned — only the outer product archive needs signing)
+          pkgbuild \
+            --root driver-root \
+            --install-location / \
+            --identifier com.aethersdr.dax \
+            --version "$APP_VERSION" \
+            AetherSDRDAX-component.pkg
+
+          # Distribution XML — onConclusion="RequireRestart" triggers the reboot prompt
+          cat > distribution.xml <<'DISTXML'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <installer-gui-script minSpecVersion="2">
+              <title>AetherSDR DAX Audio Drivers</title>
+              <options customize="never" require-scripts="false"/>
+              <pkg-ref id="com.aethersdr.dax" version="__VERSION__"
+                       onConclusion="RequireRestart">AetherSDRDAX-component.pkg</pkg-ref>
+              <choices-outline>
+                  <line choice="com.aethersdr.dax"/>
+              </choices-outline>
+              <choice id="com.aethersdr.dax" title="AetherSDR DAX Audio Drivers">
+                  <pkg-ref id="com.aethersdr.dax"/>
+              </choice>
+          </installer-gui-script>
+          DISTXML
+          sed -i '' 's/^          //' distribution.xml
+          sed -i '' "s/__VERSION__/$APP_VERSION/g" distribution.xml
+
+          productbuild \
+            --distribution distribution.xml \
+            --package-path . \
+            --sign "Developer ID Installer" \
+            "AetherSDR DAX Drivers.pkg"
+
+          echo "DAX driver PKG v${APP_VERSION} built and signed"
+
+      - name: Create DMG
+        run: |
+          mkdir -p dmg-stage
+          ditto build/AetherSDR.app dmg-stage/AetherSDR.app
+          cp "AetherSDR DAX Drivers.pkg" dmg-stage/
+
+          # Layout: app (left) + Applications link (right), PKG below Applications
+          create-dmg \
+            --volname "AetherSDR" \
+            --volicon "docs/AetherSDR.icns" \
+            --background "docs/logo-invert.png" \
+            --window-pos 200 120 \
+            --window-size 600 400 \
+            --icon-size 100 \
+            --icon "AetherSDR.app" 150 120 \
+            --hide-extension "AetherSDR.app" \
+            --app-drop-link 450 120 \
+            --icon "AetherSDR DAX Drivers.pkg" 450 290 \
+            "AetherSDR-${{ github.ref_name }}-macOS-${{ matrix.label }}.dmg" \
+            "dmg-stage/" \
+          || true
+
+      - name: Sign DMG
+        env:
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          codesign --force --timestamp \
+            --sign "Developer ID Application" \
+            AetherSDR-${{ github.ref_name }}-macOS-${{ matrix.label }}.dmg
+
+      - name: Notarize DMG
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_PASSWORD: ${{ secrets.APPLE_APP_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          xcrun notarytool submit \
+            AetherSDR-${{ github.ref_name }}-macOS-${{ matrix.label }}.dmg \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --wait --timeout 600 2>&1 | tee notarize-output.txt || true
+
+          # Extract submission ID and fetch detailed log on failure
+          SUB_ID=$(grep -oE '[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}' notarize-output.txt | head -1)
+          if grep -q "Invalid" notarize-output.txt; then
+            echo "=== Notarization FAILED — fetching Apple's rejection log ==="
+            xcrun notarytool log "$SUB_ID" \
+              --apple-id "$APPLE_ID" \
+              --password "$APPLE_APP_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID" || true
+            exit 1
+          fi
+
+          xcrun stapler staple \
+            AetherSDR-${{ github.ref_name }}-macOS-${{ matrix.label }}.dmg
+          echo "Notarization and stapling complete"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: macOS-DMG-${{ matrix.label }}
+          path: AetherSDR-*.dmg
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: AetherSDR-*.dmg

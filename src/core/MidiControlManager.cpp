@@ -1,0 +1,417 @@
+#ifdef HAVE_MIDI
+
+#include "MidiControlManager.h"
+#include "LogManager.h"
+
+#include <RtMidi.h>
+#include <QDateTime>
+#include <QDebug>
+#include <algorithm>
+#include <cmath>
+
+namespace AetherSDR {
+
+// ── MidiBinding helpers ─────────────────────────────────────────────────────
+
+QString MidiBinding::sourceDisplayName() const
+{
+    QString typeName;
+    switch (msgType) {
+    case CC:       typeName = QString("CC #%1").arg(number); break;
+    case NoteOn:   typeName = QString("Note %1").arg(number); break;
+    case NoteOff:  typeName = QString("NoteOff %1").arg(number); break;
+    case PitchBend: typeName = "Pitch Bend"; break;
+    }
+    if (channel >= 0)
+        return QString("Ch %1 %2").arg(channel + 1).arg(typeName);
+    return typeName;
+}
+
+// ── MidiControlManager ──────────────────────────────────────────────────────
+
+MidiControlManager::MidiControlManager(QObject* parent)
+    : QObject(parent)
+    , m_hotplugTimer(new QTimer(this))
+    , m_relativeTimer(new QTimer(this))
+{
+    m_hotplugTimer->setInterval(5000);
+    connect(m_hotplugTimer, &QTimer::timeout, this, [this] {
+        if (m_portName.isEmpty()) {
+            return;
+        }
+        if (m_midiIn && m_midiIn->isPortOpen()) {
+            // Hot-unplug: most RtMidi backends keep the port "open" after
+            // the device disappears, so check the port list instead.
+            const QStringList ports = availablePorts();
+            const bool present = std::any_of(ports.cbegin(), ports.cend(),
+                [this](const QString& p) { return p.contains(m_portName, Qt::CaseInsensitive); });
+            if (present) {
+                return;
+            }
+            qCWarning(lcDevices) << "MidiControlManager: device disappeared:" << m_portName;
+            try {
+                m_midiIn->closePort();
+            } catch (...) {}
+            m_midiIn.reset();
+            // Keep m_portName and the timer running so we reconnect on replug.
+            emit portError(QStringLiteral("MIDI device \"%1\" disconnected").arg(m_portName));
+            return;
+        }
+        // Hotplug: disconnected but we have a saved port name — try to reconnect
+        openPortByName(m_portName, /*quiet=*/true);
+    });
+
+    // Coalesce relative knob events every 20ms with acceleration
+    m_relativeTimer->setInterval(20);
+    connect(m_relativeTimer, &QTimer::timeout, this, &MidiControlManager::flushRelativeAccum);
+}
+
+MidiControlManager::~MidiControlManager()
+{
+    closePort();
+}
+
+// ── Device management ───────────────────────────────────────────────────────
+
+QStringList MidiControlManager::availablePorts() const
+{
+    QStringList result;
+    try {
+        RtMidiIn probe;
+        unsigned int n = probe.getPortCount();
+        for (unsigned int i = 0; i < n; ++i)
+            result.append(QString::fromStdString(probe.getPortName(i)));
+    } catch (const RtMidiError& e) {
+        qCWarning(lcDevices) << "MidiControlManager: error enumerating ports:" << e.what();
+    }
+    return result;
+}
+
+bool MidiControlManager::openPort(int portIndex)
+{
+    closePort();
+    try {
+        m_midiIn = std::make_unique<RtMidiIn>();
+        if (static_cast<unsigned>(portIndex) >= m_midiIn->getPortCount()) {
+            qCWarning(lcDevices) << "MidiControlManager: port index" << portIndex << "out of range";
+            m_midiIn.reset();
+            emit portError(QStringLiteral("MIDI port no longer available"));
+            return false;
+        }
+        m_portName = QString::fromStdString(m_midiIn->getPortName(portIndex));
+        m_midiIn->openPort(portIndex);
+        m_midiIn->setCallback(&rtmidiCallback, this);
+        m_midiIn->ignoreTypes(true, true, true); // ignore sysex, timing, active sensing
+        qCDebug(lcDevices) << "MidiControlManager: opened port" << m_portName;
+        m_hotplugTimer->start();
+        emit portOpened(m_portName);
+        return true;
+    } catch (const RtMidiError& e) {
+        qCWarning(lcDevices) << "MidiControlManager: open failed:" << e.what();
+        m_midiIn.reset();
+        emit portError(QString::fromStdString(e.getMessage()));
+        return false;
+    }
+}
+
+bool MidiControlManager::openPortByName(const QString& portName, bool quiet)
+{
+    try {
+        RtMidiIn probe;
+        unsigned int n = probe.getPortCount();
+        for (unsigned int i = 0; i < n; ++i) {
+            if (QString::fromStdString(probe.getPortName(i)).contains(portName, Qt::CaseInsensitive)) {
+                return openPort(static_cast<int>(i));
+            }
+        }
+    } catch (const RtMidiError&) {}
+    if (!quiet) {
+        emit portError(QStringLiteral("MIDI device \"%1\" not found").arg(portName));
+    }
+    return false;
+}
+
+void MidiControlManager::closePort()
+{
+    m_hotplugTimer->stop();
+    // Only report a close when a port was actually open — openPort() calls
+    // closePort() first, and hotplug retries must not spam portClosed.
+    if (!m_midiIn) {
+        return;
+    }
+    try {
+        if (m_midiIn->isPortOpen()) {
+            m_midiIn->closePort();
+        }
+    } catch (...) {}
+    m_midiIn.reset();
+    emit portClosed();
+}
+
+bool MidiControlManager::isOpen() const
+{
+    return m_midiIn && m_midiIn->isPortOpen();
+}
+
+// ── Parameter registry ──────────────────────────────────────────────────────
+
+void MidiControlManager::registerParam(const MidiParam& param)
+{
+    m_paramIndex[param.id] = m_params.size();
+    m_params.append(param);
+}
+
+const MidiParam* MidiControlManager::findParam(const QString& id) const
+{
+    auto it = m_paramIndex.find(id);
+    if (it == m_paramIndex.end()) return nullptr;
+    return &m_params[it.value()];
+}
+
+// ── Binding management ──────────────────────────────────────────────────────
+
+void MidiControlManager::addBinding(const MidiBinding& binding)
+{
+    // Remove any existing binding for this param
+    removeBinding(binding.paramId);
+    m_bindings.append(binding);
+    rebuildIndex();
+}
+
+void MidiControlManager::removeBinding(const QString& paramId)
+{
+    for (int i = m_bindings.size() - 1; i >= 0; --i) {
+        if (m_bindings[i].paramId == paramId) {
+            m_bindings.removeAt(i);
+        }
+    }
+    rebuildIndex();
+}
+
+void MidiControlManager::clearBindings()
+{
+    m_bindings.clear();
+    m_bindingIndex.clear();
+}
+
+void MidiControlManager::rebuildIndex()
+{
+    m_bindingIndex.clear();
+    for (int i = 0; i < m_bindings.size(); ++i)
+        m_bindingIndex[m_bindings[i].key()] = i;
+}
+
+// ── MIDI Learn ──────────────────────────────────────────────────────────────
+
+void MidiControlManager::startLearn(const QString& paramId)
+{
+    m_learning = true;
+    m_learnParamId = paramId;
+    qCDebug(lcDevices) << "MidiControlManager: learning for" << paramId;
+}
+
+void MidiControlManager::cancelLearn()
+{
+    m_learning = false;
+    m_learnParamId.clear();
+    emit learnCancelled();
+}
+
+// ── RtMidi callback → Qt main thread ────────────────────────────────────────
+
+void MidiControlManager::rtmidiCallback(double /*deltatime*/,
+                                         std::vector<unsigned char>* message,
+                                         void* userData)
+{
+    if (!message || message->size() < 2) return;
+    auto* self = static_cast<MidiControlManager*>(userData);
+    int status = (*message)[0];
+    int data1 = (*message)[1];
+    int data2 = message->size() > 2 ? (*message)[2] : 0;
+
+    // Bridge to Qt main thread
+    QMetaObject::invokeMethod(self, [self, status, data1, data2]() {
+        self->onMidiMessage(status, data1, data2);
+    }, Qt::QueuedConnection);
+}
+
+void MidiControlManager::onMidiMessage(int status, int data1, int data2)
+{
+    int channel = status & 0x0F;
+    int type = status & 0xF0;
+
+    // Determine message type and normalized value
+    MidiBinding::MsgType msgType;
+    int number = data1;
+    float normValue = 0.0f;
+
+    if (type == 0xB0) {          // Control Change
+        msgType = MidiBinding::CC;
+        normValue = data2 / 127.0f;
+    } else if (type == 0x90) {   // Note On
+        msgType = MidiBinding::NoteOn;
+        normValue = data2 > 0 ? 1.0f : 0.0f;
+    } else if (type == 0x80) {   // Note Off
+        msgType = MidiBinding::NoteOff;
+        normValue = 0.0f;
+    } else if (type == 0xE0) {   // Pitch Bend
+        msgType = MidiBinding::PitchBend;
+        number = -1;
+        normValue = (data1 | (data2 << 7)) / 16383.0f;
+    } else {
+        return; // ignore other message types
+    }
+
+    emit midiActivity(channel, static_cast<int>(msgType), number,
+                      static_cast<int>(normValue * 127));
+
+    // MIDI Learn mode — capture this message as a binding
+    if (m_learning) {
+        if (msgType == MidiBinding::NoteOff) return; // ignore NoteOff during learn
+
+        MidiBinding binding;
+        binding.channel = channel;
+        binding.msgType = msgType;
+        binding.number = (msgType == MidiBinding::PitchBend) ? -1 : data1;
+        binding.paramId = m_learnParamId;
+        binding.inverted = false;
+
+        addBinding(binding);
+        m_learning = false;
+        qCDebug(lcDevices) << "MidiControlManager: learned" << binding.sourceDisplayName()
+                 << "→" << m_learnParamId;
+        emit learnCompleted(m_learnParamId, binding);
+        m_learnParamId.clear();
+        return;
+    }
+
+    // Normal dispatch — look up binding and route value
+    quint32 key = MidiBinding{channel, msgType, number, {}, false}.key();
+    auto it = m_bindingIndex.find(key);
+
+    // Try wildcard channel (-1 → 0xFF in key)
+    if (it == m_bindingIndex.end()) {
+        quint32 wildKey = (0xFF << 16) | (msgType << 8) |
+                          ((msgType == MidiBinding::PitchBend) ? 0xFF : (number & 0x7F));
+        it = m_bindingIndex.find(wildKey);
+    }
+
+    // For Gate params (CW key): NoteOff must also match NoteOn bindings
+    if (it == m_bindingIndex.end() && msgType == MidiBinding::NoteOff) {
+        quint32 noteOnKey = MidiBinding{channel, MidiBinding::NoteOn, number, {}, false}.key();
+        it = m_bindingIndex.find(noteOnKey);
+        if (it == m_bindingIndex.end()) {
+            quint32 wildNoteOnKey = (0xFF << 16) | (MidiBinding::NoteOn << 8) | (number & 0x7F);
+            it = m_bindingIndex.find(wildNoteOnKey);
+        }
+    }
+
+    if (it == m_bindingIndex.end()) return;
+
+    const auto& binding = m_bindings[it.value()];
+
+    // ── Relative knob mode: decode delta and accumulate ────────────────
+    if (binding.relative && msgType == MidiBinding::CC) {
+        // Relative CC encoding (two's complement style):
+        // 1-63 = clockwise (1=slow, 63=fast)
+        // 65-127 = counter-clockwise (127=-1, 126=-2)
+        int delta = (data2 < 64) ? data2 : (data2 - 128);
+        if (binding.inverted) delta = -delta;
+
+        auto& accum = m_relativeAccum[binding.paramId];
+        accum.steps += delta;
+        accum.eventCount++;
+        accum.lastEventMs = QDateTime::currentMSecsSinceEpoch();
+
+        if (!m_relativeTimer->isActive())
+            m_relativeTimer->start();
+
+        emit paramValueChanged(binding.paramId, delta > 0 ? 1.0f : 0.0f);
+        return;
+    }
+
+    // ── Absolute mode: existing behavior ───────────────────────────────
+    float value = binding.inverted ? (1.0f - normValue) : normValue;
+
+    // Scale to parameter range
+    const MidiParam* param = findParam(binding.paramId);
+    if (param) {
+        float scaled = param->rangeMin + value * (param->rangeMax - param->rangeMin);
+
+        // For toggles: use > 0.5 threshold; for triggers: only fire on > 0.5
+        if (param->type == MidiParamType::Toggle) {
+            // NoteOn = toggle (sentinel -1 tells MainWindow to flip current state)
+            // CC = direct threshold
+            if (msgType == MidiBinding::NoteOn) {
+                scaled = -1.0f;  // sentinel: MainWindow reads getter and toggles (#502)
+            } else {
+                scaled = (value > 0.5f) ? 1.0f : 0.0f;
+            }
+        } else if (param->type == MidiParamType::Trigger) {
+            if (value < 0.5f) return; // only fire on press, not release
+            scaled = 1.0f;
+        } else if (param->type == MidiParamType::Gate) {
+            // Gate: NoteOn vel>0 = key down (1.0), NoteOff or vel=0 = key up (0.0)
+            // No toggling — direct follow of key state
+            scaled = normValue > 0.0f ? 1.0f : 0.0f;
+        }
+
+        // Don't call setter directly — may be on a worker thread while
+        // setters access main-thread objects. Emit signal instead. (#502)
+        emit paramAction(binding.paramId, scaled);
+    }
+
+    emit paramValueChanged(binding.paramId, value);
+}
+
+// ── Relative knob coalescing with acceleration ─────────────────────────────
+// Called every 20ms. Batches accumulated steps and applies acceleration:
+//   Slow  (≤2 events/window): ÷2 rate — halve steps for fine tuning
+//   Medium (3-6):              1:1 — normal rate
+//   Fast   (>6):               4× — multiply steps for rapid band scanning
+
+void MidiControlManager::flushRelativeAccum()
+{
+    bool anyActive = false;
+    const qint64 now = QDateTime::currentMSecsSinceEpoch();
+
+    for (auto it = m_relativeAccum.begin(); it != m_relativeAccum.end(); ++it) {
+        auto& a = it.value();
+        if (a.steps == 0 && (now - a.lastEventMs) > 100) continue;
+
+        if (a.steps != 0) {
+            int steps = a.steps;
+
+            // Apply acceleration based on event density in this 20ms window
+            if (a.eventCount <= 2) {
+                // Slow: halve steps (skip if only 1 step and alternating)
+                if (steps == 1 || steps == -1) {
+                    static int slowDivider = 0;
+                    if (++slowDivider % 2 == 0) steps = 0;
+                }
+            } else if (a.eventCount > 6) {
+                // Fast: 4× acceleration
+                steps *= 4;
+            }
+            // Medium (3-6 events): 1:1, no change
+
+            if (steps != 0)
+                emit relativeAction(it.key(), steps);
+
+            a.steps = 0;
+            a.eventCount = 0;
+            anyActive = true;
+        }
+
+        // Keep timer alive if we had recent events
+        if ((now - a.lastEventMs) < 100)
+            anyActive = true;
+    }
+
+    if (!anyActive)
+        m_relativeTimer->stop();
+}
+
+} // namespace AetherSDR
+
+#endif // HAVE_MIDI

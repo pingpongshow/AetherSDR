@@ -1,0 +1,110 @@
+name: CI
+
+on:
+  pull_request:
+    branches: [main]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container: ghcr.io/ten9876/aethersdr-ci:latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Setup DeepFilterNet3 (DFNR)
+        run: bash setup-deepfilter.sh
+
+      - name: Configure
+        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Test
+        working-directory: build
+        # Widget-based tests need a platform plugin; there is no display in CI.
+        env:
+          QT_QPA_PLATFORM: offscreen
+        run: ctest --output-on-failure
+
+  # Sanitizer build. ASan/UBSan used to be wired to CONFIG:Debug only, so the
+  # configuration everyone actually ships (RelWithDebInfo) was never
+  # instrumented and no CI job ever ran the test suite under a sanitizer.
+  # This job covers the protocol parsers, which consume unvalidated network
+  # input and are where memory-safety bugs actually land.
+  sanitizers:
+    runs-on: ubuntu-latest
+    container: ghcr.io/ten9876/aethersdr-ci:latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Configure (ASan + UBSan)
+        run: cmake -B build-asan -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DENABLE_ASAN=ON
+
+      # Only the test targets — instrumenting the full GUI app would add
+      # several minutes without covering anything these tests don't.
+      - name: Build tests
+        run: |
+          cmake --build build-asan -j$(nproc) \
+            --target command_parser_test vita49_parse_test command_palette_test
+
+      - name: Run parser tests under sanitizers
+        working-directory: build-asan
+        env:
+          QT_QPA_PLATFORM: offscreen
+          ASAN_OPTIONS: detect_leaks=0:abort_on_error=1
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+        run: |
+          ./command_parser_test
+          ./vita49_parse_test
+          ./command_palette_test
+
+  # Detect if build system or third-party deps changed
+  check-paths:
+    runs-on: ubuntu-latest
+    outputs:
+      build-changed: ${{ steps.filter.outputs.build }}
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dorny/paths-filter@v4
+        id: filter
+        with:
+          filters: |
+            build:
+              - 'CMakeLists.txt'
+              - 'third_party/**'
+              - '.github/workflows/**'
+
+  # Cross-platform build check — runs only when CMakeLists.txt, third_party/,
+  # or workflows are modified, to catch MSVC issues before release. (#796 lesson)
+  check-windows:
+    needs: [build, check-paths]
+    if: needs.check-paths.outputs.build-changed == 'true'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Qt
+        uses: jurplel/install-qt-action@v4
+        with:
+          version: '6.7.3'
+          modules: 'qtmultimedia qtwebsockets qtserialport qtshadertools'
+
+      - name: Install FFTW3
+        shell: pwsh
+        run: |
+          if (Test-Path scripts/setup-fftw.ps1) { ./scripts/setup-fftw.ps1 }
+          elseif (Test-Path setup-fftw.ps1) { ./setup-fftw.ps1 }
+          else { Write-Host "No FFTW setup script — skipping" }
+
+      - name: Setup DeepFilterNet3 (DFNR)
+        shell: pwsh
+        run: .\setup-deepfilter.ps1
+
+      - name: Configure
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DENABLE_RADE=OFF
+
+      - name: Build
+        run: cmake --build build --config Release -j $env:NUMBER_OF_PROCESSORS

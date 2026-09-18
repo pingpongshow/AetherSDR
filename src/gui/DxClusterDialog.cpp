@@ -1,0 +1,1991 @@
+#include "DxClusterDialog.h"
+#include "GuardedSlider.h"
+#include "core/DxClusterClient.h"
+#include "core/AppSettings.h"
+#include "models/RadioModel.h"
+
+#include <QVBoxLayout>
+#include <QHBoxLayout>
+#include <QGridLayout>
+#include <QLabel>
+#include <QLineEdit>
+#include <QSpinBox>
+#include <QPushButton>
+#include <QCheckBox>
+#include <QGroupBox>
+#include <QPlainTextEdit>
+#include <QScrollBar>
+#include <QTabWidget>
+#include <QTableView>
+#include <QHeaderView>
+#include <QSortFilterProxyModel>
+#include <QSlider>
+#include <QColorDialog>
+#include <QFile>
+#include <QFileDialog>
+#include <QFileInfo>
+#include <QRegularExpression>
+#include <QTimer>
+
+#include <algorithm>
+
+namespace AetherSDR {
+
+// Read the last N lines of a file without loading the entire thing.
+static QStringList tailFile(const QString& path, int maxLines = 500)
+{
+    QFile f(path);
+    if (!f.open(QIODevice::ReadOnly | QIODevice::Text))
+        return {};
+
+    // For small files, just read everything
+    if (f.size() < 64 * 1024) {
+        QStringList lines;
+        while (!f.atEnd()) {
+            QString line = QString::fromUtf8(f.readLine()).trimmed();
+            if (!line.isEmpty())
+                lines.append(line);
+        }
+        if (lines.size() > maxLines)
+            lines = lines.mid(lines.size() - maxLines);
+        return lines;
+    }
+
+    // For large files, seek backwards to find enough newlines
+    constexpr qint64 CHUNK = 8192;
+    qint64 pos = f.size();
+    QByteArray tail;
+    int nlCount = 0;
+    while (pos > 0 && nlCount <= maxLines) {
+        qint64 readSize = qMin(CHUNK, pos);
+        pos -= readSize;
+        f.seek(pos);
+        QByteArray chunk = f.read(readSize);
+        tail.prepend(chunk);
+        nlCount += chunk.count('\n');
+    }
+    QStringList all = QString::fromUtf8(tail).split('\n', Qt::SkipEmptyParts);
+    for (auto& s : all) s = s.trimmed();
+    all.removeAll(QString());
+    if (all.size() > maxLines)
+        all = all.mid(all.size() - maxLines);
+    return all;
+}
+
+// ── SpotTableModel ──────────────────────────────────────────────────────────
+
+QString SpotTableModel::extractMode(const QString& comment)
+{
+    static const QSet<QString> known = {
+        "CW", "SSB", "USB", "LSB", "AM", "FM", "FT8", "FT4",
+        "JS8", "RTTY", "PSK31", "PSK63", "PSK125", "QPSK31",
+        "QPSK63", "QPSK125", "PSK", "OLIVIA", "JT65", "JT9",
+        "WSPR", "SAM", "NFM", "DIGU", "DIGL"
+    };
+    QStringList words = comment.split(' ', Qt::SkipEmptyParts);
+    if (!words.isEmpty() && known.contains(words.first().toUpper()))
+        return words.first().toUpper();
+    if (!words.isEmpty() && known.contains(words.last().toUpper()))
+        return words.last().toUpper();
+    return {};
+}
+
+QVariant SpotTableModel::data(const QModelIndex& index, int role) const
+{
+    if (!index.isValid() || index.row() >= m_spots.size())
+        return {};
+
+    const auto& spot = m_spots[index.row()];
+
+    if (role == Qt::DisplayRole) {
+        switch (index.column()) {
+        case ColTime:    return spot.utcTime.toString("HH:mm");
+        case ColFreq:    return QString::number(spot.freqMhz * 1000.0, 'f', 1);
+        case ColDxCall:  return spot.dxCall;
+        case ColMode:    return extractMode(spot.comment);
+        case ColComment: return spot.comment;
+        case ColSpotter: return spot.spotterCall;
+        case ColBand:    return bandForFreq(spot.freqMhz);
+        case ColSource:  return spot.source;
+        }
+    }
+    if (role == Qt::TextAlignmentRole) {
+        if (index.column() == ColFreq)
+            return QVariant(Qt::AlignRight | Qt::AlignVCenter);
+        if (index.column() == ColTime)
+            return QVariant(Qt::AlignCenter);
+    }
+    if (role == Qt::ForegroundRole) {
+        if (index.column() == ColDxCall)
+            return QColor(0x00, 0xb4, 0xd8);  // accent
+        if (index.column() == ColFreq)
+            return QColor(0xe0, 0xd0, 0x60);  // yellow-ish
+    }
+    // Store freq in UserRole for sorting
+    if (role == Qt::UserRole && index.column() == ColFreq)
+        return spot.freqMhz;
+
+    return {};
+}
+
+QVariant SpotTableModel::headerData(int section, Qt::Orientation orientation, int role) const
+{
+    if (orientation != Qt::Horizontal || role != Qt::DisplayRole)
+        return {};
+    switch (section) {
+    case ColTime:    return "Time";
+    case ColFreq:    return "Freq (kHz)";
+    case ColDxCall:  return "DX Call";
+    case ColMode:    return "Mode";
+    case ColComment: return "Comment";
+    case ColSpotter: return "Spotter";
+    case ColBand:    return "Band";
+    case ColSource:  return "Source";
+    }
+    return {};
+}
+
+void SpotTableModel::addSpot(const DxSpot& spot)
+{
+    beginInsertRows({}, 0, 0);
+    m_spots.prepend(spot);
+    endInsertRows();
+
+    if (m_spots.size() > m_maxSpots) {
+        beginRemoveRows({}, m_maxSpots, m_spots.size() - 1);
+        m_spots.resize(m_maxSpots);
+        endRemoveRows();
+    }
+}
+
+void SpotTableModel::addSpots(const QVector<DxSpot>& spots)
+{
+    if (spots.isEmpty()) return;
+    int count = spots.size();
+    beginInsertRows({}, 0, count - 1);
+    // Prepend in reverse so newest is at index 0
+    for (int i = count - 1; i >= 0; --i)
+        m_spots.prepend(spots[i]);
+    endInsertRows();
+
+    if (m_spots.size() > m_maxSpots) {
+        beginRemoveRows({}, m_maxSpots, m_spots.size() - 1);
+        m_spots.resize(m_maxSpots);
+        endRemoveRows();
+    }
+}
+
+double SpotTableModel::freqAtRow(int row) const
+{
+    if (row >= 0 && row < m_spots.size())
+        return m_spots[row].freqMhz;
+    return 0.0;
+}
+
+void SpotTableModel::clear()
+{
+    beginResetModel();
+    m_spots.clear();
+    endResetModel();
+}
+
+QString SpotTableModel::bandForFreq(double mhz)
+{
+    if (mhz >= 1.8   && mhz <= 2.0)    return "160m";
+    if (mhz >= 3.5   && mhz <= 4.0)    return "80m";
+    if (mhz >= 5.0   && mhz <= 5.5)    return "60m";
+    if (mhz >= 7.0   && mhz <= 7.3)    return "40m";
+    if (mhz >= 10.1  && mhz <= 10.15)  return "30m";
+    if (mhz >= 14.0  && mhz <= 14.35)  return "20m";
+    if (mhz >= 18.068 && mhz <= 18.168) return "17m";
+    if (mhz >= 21.0  && mhz <= 21.45)  return "15m";
+    if (mhz >= 24.89 && mhz <= 24.99)  return "12m";
+    if (mhz >= 28.0  && mhz <= 29.7)   return "10m";
+    if (mhz >= 50.0  && mhz <= 54.0)   return "6m";
+    if (mhz >= 144.0 && mhz <= 148.0)  return "2m";
+    return "";
+}
+
+// ── BandFilterProxy ─────────────────────────────────────────────────────────
+
+void BandFilterProxy::setBandVisible(const QString& band, bool visible)
+{
+    if (visible)
+        m_hiddenBands.remove(band);
+    else
+        m_hiddenBands.insert(band);
+    invalidateFilter();
+}
+
+bool BandFilterProxy::filterAcceptsRow(int sourceRow, const QModelIndex& sourceParent) const
+{
+    if (m_hiddenBands.isEmpty())
+        return true;
+    auto idx = sourceModel()->index(sourceRow, SpotTableModel::ColBand, sourceParent);
+    QString band = sourceModel()->data(idx, Qt::DisplayRole).toString();
+    if (band.isEmpty())
+        return true;  // unknown band — always show
+    return !m_hiddenBands.contains(band);
+}
+
+// ── DxClusterDialog ─────────────────────────────────────────────────────────
+
+DxClusterDialog::DxClusterDialog(DxClusterClient* clusterClient, DxClusterClient* rbnClient,
+                                   DigitalModeSpotClient* digitalSpotClient,
+                                   SpotCollectorClient* spotCollectorClient,
+                                   PotaClient* potaClient,
+#ifdef HAVE_WEBSOCKETS
+                                   FreeDvClient* freedvClient,
+#endif
+                                   RadioModel* radioModel,
+                                   DxccColorProvider* dxccProvider,
+                                   QWidget* parent)
+    : QDialog(parent), m_client(clusterClient), m_rbnClient(rbnClient),
+      m_digitalSpotClient(digitalSpotClient), m_spotCollectorClient(spotCollectorClient),
+      m_potaClient(potaClient),
+#ifdef HAVE_WEBSOCKETS
+      m_freedvClient(freedvClient),
+#endif
+      m_radioModel(radioModel), m_dxccProvider(dxccProvider)
+{
+    setWindowTitle("SpotHub");
+    setMinimumSize(680, 560);
+    resize(760, 640);
+
+    auto* root = new QVBoxLayout(this);
+    root->setSpacing(0);
+    root->setContentsMargins(4, 4, 4, 4);
+
+    auto* tabs = new QTabWidget;
+    m_tabs = tabs;
+    tabs->setStyleSheet(
+        "QTabWidget::pane { border: 1px solid #203040; }"
+        "QTabBar::tab { background: #1a1a2e; color: #808890; border: 1px solid #203040; "
+        "  padding: 6px 16px; margin-right: 2px; }"
+        "QTabBar::tab:selected { background: #0f0f1a; color: #00b4d8; border-bottom: none; }");
+
+    buildClusterTab(tabs);
+    buildRbnTab(tabs);
+    buildDigitalSpotTab(tabs);
+    buildSpotCollectorTab(tabs);
+    buildPotaTab(tabs);
+#ifdef HAVE_WEBSOCKETS
+    buildFreeDvTab(tabs);
+#endif
+    buildSpotListTab(tabs);
+    buildDisplayTab(tabs);
+
+    root->addWidget(tabs);
+
+    // ── Spot batch timer (1/sec flush) ──────────────────────────────────
+    m_spotBatchTimer = new QTimer(this);
+    m_spotBatchTimer->start(1000);
+    connect(m_spotBatchTimer, &QTimer::timeout, this, &DxClusterDialog::flushSpotBatch);
+
+    // Auto-scroll helper: only scroll if user is already at the bottom
+    auto isAtBottom = [](QAbstractScrollArea* w) {
+        auto* sb = w->verticalScrollBar();
+        return sb->value() >= sb->maximum() - 2;
+    };
+
+    // ── Live updates from client ────────────────────────────────────────
+    connect(clusterClient, &DxClusterClient::rawLineReceived, this, [this, isAtBottom](const QString& line) {
+        bool follow = isAtBottom(m_console);
+        m_console->appendPlainText(line);
+        if (follow) {
+            auto* sb = m_console->verticalScrollBar();
+            sb->setValue(sb->maximum());
+        }
+    });
+
+    connect(clusterClient, &DxClusterClient::spotReceived, this, [this](DxSpot spot) {
+        spot.source = "Cluster";
+        m_spotBatch.append(spot);
+    });
+
+    connect(clusterClient, &DxClusterClient::connected, this, [this] {
+        m_statusLabel->setText(QString("Connected to %1:%2").arg(m_client->host()).arg(m_client->port()));
+        m_statusLabel->setStyleSheet("QLabel { color: #00b4d8; font-size: 11px; }");
+        m_connectBtn->setText("Disconnect");
+        m_cmdEdit->setEnabled(true);
+        m_sendBtn->setEnabled(true);
+        m_console->appendPlainText("--- Connected ---");
+    });
+    connect(clusterClient, &DxClusterClient::disconnected, this, [this] {
+        m_statusLabel->setText("Disconnected");
+        m_statusLabel->setStyleSheet("QLabel { color: #808080; font-size: 11px; }");
+        m_connectBtn->setText("Connect");
+        m_cmdEdit->setEnabled(false);
+        m_sendBtn->setEnabled(false);
+        m_console->appendPlainText("--- Disconnected ---");
+    });
+    connect(clusterClient, &DxClusterClient::connectionError, this, [this](const QString& err) {
+        m_statusLabel->setText("Error: " + err);
+        m_statusLabel->setStyleSheet("QLabel { color: #ff4444; font-size: 11px; }");
+        m_console->appendPlainText("--- Error: " + err + " ---");
+    });
+
+    // Defer log file loading until after the dialog is shown (#748).
+    // Reads only the last 500 lines per file to avoid blocking on large logs.
+    auto clusterLogPath = clusterClient->logFilePath();
+    auto rbnLogPath = rbnClient->logFilePath();
+    auto digitalLogPath = digitalSpotClient->logFilePath();
+    auto potaLogPath = potaClient->logFilePath();
+    QString freedvLogPath;
+#ifdef HAVE_WEBSOCKETS
+    freedvLogPath = freedvClient->logFilePath();
+#endif
+    QTimer::singleShot(0, this, [this, clusterLogPath, rbnLogPath,
+                                  digitalLogPath, potaLogPath, freedvLogPath]() {
+        loadLogFiles(clusterLogPath, rbnLogPath, digitalLogPath, potaLogPath, freedvLogPath);
+    });
+
+    // ── Live updates from RBN client ──────────────────────────────────
+    connect(rbnClient, &DxClusterClient::rawLineReceived, this, [this, isAtBottom](const QString& line) {
+        bool follow = isAtBottom(m_rbnConsole);
+        m_rbnConsole->appendPlainText(line);
+        if (follow) {
+            auto* sb = m_rbnConsole->verticalScrollBar();
+            sb->setValue(sb->maximum());
+        }
+    });
+
+    connect(rbnClient, &DxClusterClient::spotReceived, this, [this](DxSpot spot) {
+        spot.source = "RBN";
+        m_spotBatch.append(spot);
+    });
+
+    connect(rbnClient, &DxClusterClient::connected, this, [this] {
+        m_rbnStatusLabel->setText(QString("Connected to %1:%2").arg(m_rbnClient->host()).arg(m_rbnClient->port()));
+        m_rbnStatusLabel->setStyleSheet("QLabel { color: #00b4d8; font-size: 11px; }");
+        m_rbnConnectBtn->setText("Disconnect");
+        m_rbnCmdEdit->setEnabled(true);
+        m_rbnSendBtn->setEnabled(true);
+        m_rbnConsole->appendPlainText("--- Connected ---");
+    });
+    connect(rbnClient, &DxClusterClient::disconnected, this, [this] {
+        m_rbnStatusLabel->setText("Disconnected");
+        m_rbnStatusLabel->setStyleSheet("QLabel { color: #808080; font-size: 11px; }");
+        m_rbnConnectBtn->setText("Connect");
+        m_rbnCmdEdit->setEnabled(false);
+        m_rbnSendBtn->setEnabled(false);
+        m_rbnConsole->appendPlainText("--- Disconnected ---");
+    });
+    connect(rbnClient, &DxClusterClient::connectionError, this, [this](const QString& err) {
+        m_rbnStatusLabel->setText("Error: " + err);
+        m_rbnStatusLabel->setStyleSheet("QLabel { color: #ff4444; font-size: 11px; }");
+        m_rbnConsole->appendPlainText("--- Error: " + err + " ---");
+    });
+
+    // RBN log loaded in deferred loadLogFiles() (#748)
+
+    // ── Live updates from internal digital spot client ────────────────
+    connect(digitalSpotClient, &DigitalModeSpotClient::rawLineReceived,
+            this, [this, isAtBottom](const QString& line) {
+        bool follow = isAtBottom(m_digitalConsole);
+        m_digitalConsole->appendPlainText(line);
+        if (follow) {
+            auto* sb = m_digitalConsole->verticalScrollBar();
+            sb->setValue(sb->maximum());
+        }
+    });
+
+    connect(digitalSpotClient, &DigitalModeSpotClient::spotReceived, this, [this](DxSpot spot) {
+        m_spotBatch.append(spot);
+    });
+
+    // ── Live updates from SpotCollector client ───────────────────────
+    connect(spotCollectorClient, &SpotCollectorClient::rawLineReceived, this, [this, isAtBottom](const QString& line) {
+        bool follow = isAtBottom(m_scConsole);
+        m_scConsole->appendPlainText(line);
+        if (follow) {
+            auto* sb = m_scConsole->verticalScrollBar();
+            sb->setValue(sb->maximum());
+        }
+    });
+
+    connect(spotCollectorClient, &SpotCollectorClient::spotReceived, this, [this](DxSpot spot) {
+        spot.source = "SpotCollector";
+        m_spotBatch.append(spot);
+    });
+
+    connect(spotCollectorClient, &SpotCollectorClient::listening, this, [this] {
+        m_scStatusLabel->setText(QString("Listening on port %1").arg(m_scPortSpin->value()));
+        m_scStatusLabel->setStyleSheet("QLabel { color: #00b4d8; font-size: 11px; }");
+        m_scStartBtn->setText("Stop");
+        m_scConsole->appendPlainText("--- Listening ---");
+    });
+    connect(spotCollectorClient, &SpotCollectorClient::stopped, this, [this] {
+        m_scStatusLabel->setText("Stopped");
+        m_scStatusLabel->setStyleSheet("QLabel { color: #808080; font-size: 11px; }");
+        m_scStartBtn->setText("Start");
+        m_scConsole->appendPlainText("--- Stopped ---");
+    });
+
+    // ── Live updates from POTA client ─────────────────────────────────
+    connect(potaClient, &PotaClient::rawLineReceived, this, [this, isAtBottom](const QString& line) {
+        bool follow = isAtBottom(m_potaConsole);
+        m_potaConsole->appendPlainText(line);
+        if (follow) {
+            auto* sb = m_potaConsole->verticalScrollBar();
+            sb->setValue(sb->maximum());
+        }
+    });
+
+    connect(potaClient, &PotaClient::spotReceived, this, [this](DxSpot spot) {
+        spot.source = "POTA";
+        m_spotBatch.append(spot);
+    });
+
+    connect(potaClient, &PotaClient::started, this, [this] {
+        m_potaStatusLabel->setText("Polling...");
+        m_potaStatusLabel->setStyleSheet("QLabel { color: #00b4d8; font-size: 11px; }");
+        m_potaStartBtn->setText("Stop");
+        m_potaConsole->appendPlainText("--- Polling started ---");
+    });
+    connect(potaClient, &PotaClient::stopped, this, [this] {
+        m_potaStatusLabel->setText("Stopped");
+        m_potaStatusLabel->setStyleSheet("QLabel { color: #808080; font-size: 11px; }");
+        m_potaStartBtn->setText("Start");
+        m_potaConsole->appendPlainText("--- Stopped ---");
+    });
+    connect(potaClient, &PotaClient::pollError, this, [this](const QString& err) {
+        m_potaConsole->appendPlainText("--- Error: " + err + " ---");
+    });
+    connect(potaClient, &PotaClient::pollComplete, this, [this](int total, int newCount) {
+        m_potaStatusLabel->setText(QString("Polling... (%1 active, %2 new)").arg(total).arg(newCount));
+    });
+
+    // POTA log loaded in deferred loadLogFiles() (#748)
+
+#ifdef HAVE_WEBSOCKETS
+    // ── Live updates from FreeDV client ───────────────────────────────
+    connect(freedvClient, &FreeDvClient::rawLineReceived, this, [this, isAtBottom](const QString& line) {
+        bool follow = isAtBottom(m_freedvConsole);
+        m_freedvConsole->appendPlainText(line);
+        if (follow) {
+            auto* sb = m_freedvConsole->verticalScrollBar();
+            sb->setValue(sb->maximum());
+        }
+    });
+    connect(freedvClient, &FreeDvClient::spotReceived, this, [this](DxSpot spot) {
+        spot.source = "FreeDV";
+        m_spotBatch.append(spot);
+    });
+    connect(freedvClient, &FreeDvClient::started, this, [this] {
+        m_freedvStatusLabel->setText("Connecting...");
+        m_freedvStatusLabel->setStyleSheet("QLabel { color: #00b4d8; font-size: 11px; }");
+        m_freedvStartBtn->setText("Stop");
+        m_freedvConsole->appendPlainText("--- Connecting ---");
+    });
+    connect(freedvClient, &FreeDvClient::stopped, this, [this] {
+        m_freedvStatusLabel->setText("Stopped");
+        m_freedvStatusLabel->setStyleSheet("QLabel { color: #808080; font-size: 11px; }");
+        m_freedvStartBtn->setText("Start");
+        m_freedvConsole->appendPlainText("--- Stopped ---");
+    });
+    connect(freedvClient, &FreeDvClient::connectionError, this, [this](const QString& err) {
+        m_freedvConsole->appendPlainText("--- Error: " + err + " ---");
+    });
+
+    // Update status when FreeDV connects via Socket.IO
+    connect(freedvClient, &FreeDvClient::rawLineReceived, this, [this](const QString& line) {
+        if (line.startsWith("Connected to")) {
+            m_freedvStatusLabel->setText("Connected");
+            m_freedvStatusLabel->setStyleSheet("QLabel { color: #30d050; font-size: 11px; }");
+        }
+    });
+
+    // FreeDV log loaded in deferred loadLogFiles() (#748)
+#endif
+
+    // Scroll spot table to show newest entries
+    m_spotTable->scrollToBottom();
+
+    // Disable autoDefault on all buttons so Enter in command inputs
+    // only fires returnPressed, not random button clicks (#459)
+    for (auto* btn : findChildren<QPushButton*>())
+        btn->setAutoDefault(false);
+
+    updateStatus();
+}
+
+void DxClusterDialog::loadLogFiles(const QString& clusterLog, const QString& rbnLog,
+                                    const QString& digitalLog, const QString& potaLog,
+                                    const QString& freedvLog)
+{
+    static const QRegularExpression rx(
+        R"(^DX\s+de\s+(\S+?):\s+(\d+\.?\d*)\s+(\S+)\s+(.*?)\s+(\d{4})Z)",
+        QRegularExpression::CaseInsensitiveOption);
+
+    auto parseSpots = [&](const QStringList& lines, const QString& source) {
+        QVector<DxSpot> spots;
+        for (const auto& line : lines) {
+            auto match = rx.match(line);
+            if (match.hasMatch()) {
+                DxSpot spot;
+                spot.spotterCall = match.captured(1);
+                spot.freqMhz = match.captured(2).toDouble() / 1000.0;
+                spot.dxCall = match.captured(3);
+                spot.comment = match.captured(4).trimmed();
+                QString timeStr = match.captured(5);
+                spot.utcTime = QTime(timeStr.left(2).toInt(), timeStr.mid(2, 2).toInt());
+                if (spot.freqMhz > 0.0 && !spot.dxCall.isEmpty()) {
+                    spot.source = source;
+                    spots.append(spot);
+                }
+            }
+        }
+        return spots;
+    };
+
+    auto loadConsole = [](QPlainTextEdit* console, const QStringList& lines) {
+        if (!console || lines.isEmpty()) return;
+        console->setPlainText(lines.join('\n'));
+        auto* sb = console->verticalScrollBar();
+        sb->setValue(sb->maximum());
+    };
+
+    // Cluster log — parse spots + display in console
+    auto clusterLines = tailFile(clusterLog);
+    loadConsole(m_console, clusterLines);
+    auto clusterSpots = parseSpots(clusterLines, "Cluster");
+
+    // RBN log — parse spots + display in console
+    auto rbnLines = tailFile(rbnLog);
+    loadConsole(m_rbnConsole, rbnLines);
+    auto rbnSpots = parseSpots(rbnLines, "RBN");
+
+    // Internal digital spot log — display only
+    loadConsole(m_digitalConsole, tailFile(digitalLog));
+
+    // POTA log — display only
+    loadConsole(m_potaConsole, tailFile(potaLog));
+
+    // FreeDV log — display only
+#ifdef HAVE_WEBSOCKETS
+    if (!freedvLog.isEmpty())
+        loadConsole(m_freedvConsole, tailFile(freedvLog));
+#else
+    Q_UNUSED(freedvLog);
+#endif
+
+    // Batch all spots into the model at once
+    QVector<DxSpot> allSpots;
+    allSpots.reserve(clusterSpots.size() + rbnSpots.size());
+    allSpots.append(clusterSpots);
+    allSpots.append(rbnSpots);
+    if (!allSpots.isEmpty())
+        m_spotModel->addSpots(allSpots);
+
+    m_spotTable->scrollToBottom();
+}
+
+void DxClusterDialog::buildClusterTab(QTabWidget* tabs)
+{
+    auto* page = new QWidget;
+    auto* layout = new QVBoxLayout(page);
+    layout->setSpacing(8);
+
+    auto& s = AppSettings::instance();
+
+    // ── Connection settings ─────────────────────────────────────────────
+    auto* connGroup = new QGroupBox("Connection");
+    auto* connLayout = new QVBoxLayout(connGroup);
+    connLayout->setSpacing(4);
+
+    auto* grid = new QGridLayout;
+    grid->setColumnStretch(1, 1);
+    int row = 0;
+
+    grid->addWidget(new QLabel("Server:"), row, 0);
+    m_hostEdit = new QLineEdit(s.value("DxClusterHost", "dxc.nc7j.com").toString());
+    m_hostEdit->setPlaceholderText("dxc.nc7j.com");
+    m_hostEdit->setStyleSheet("QLineEdit { background: #1a1a2e; color: #c8d8e8; border: 1px solid #203040; padding: 3px; }");
+    grid->addWidget(m_hostEdit, row, 1);
+    row++;
+
+    grid->addWidget(new QLabel("Port:"), row, 0);
+    m_portSpin = new QSpinBox;
+    m_portSpin->setRange(1, 65535);
+    m_portSpin->setValue(s.value("DxClusterPort", 7300).toInt());
+    m_portSpin->setStyleSheet("QSpinBox { background: #1a1a2e; color: #c8d8e8; border: 1px solid #203040; padding: 3px; }");
+    grid->addWidget(m_portSpin, row, 1);
+    row++;
+
+    grid->addWidget(new QLabel("Callsign:"), row, 0);
+    m_callEdit = new QLineEdit(s.value("DxClusterCallsign").toString());
+    m_callEdit->setPlaceholderText("your callsign");
+    m_callEdit->setStyleSheet("QLineEdit { background: #1a1a2e; color: #c8d8e8; border: 1px solid #203040; padding: 3px; }");
+    grid->addWidget(m_callEdit, row, 1);
+    row++;
+
+    connLayout->addLayout(grid);
+
+    // Button row
+    auto* btnRow = new QHBoxLayout;
+    m_autoConnectBtn = new QPushButton(
+        s.value("DxClusterAutoConnect", "False").toString() == "True" ? "Auto-Connect: ON" : "Auto-Connect: OFF");
+    m_autoConnectBtn->setCheckable(true);
+    m_autoConnectBtn->setChecked(s.value("DxClusterAutoConnect", "False").toString() == "True");
+    m_autoConnectBtn->setStyleSheet(
+        "QPushButton { background: #206030; color: white; border: 1px solid #305040; padding: 4px 10px; }"
+        "QPushButton:!checked { background: #603020; }");
+    connect(m_autoConnectBtn, &QPushButton::toggled, this, [this](bool on) {
+        m_autoConnectBtn->setText(on ? "Auto-Connect: ON" : "Auto-Connect: OFF");
+        auto& s = AppSettings::instance();
+        s.setValue("DxClusterAutoConnect", on ? "True" : "False");
+        s.save();
+    });
+    btnRow->addWidget(m_autoConnectBtn);
+    btnRow->addStretch();
+
+    m_statusLabel = new QLabel("Disconnected");
+    m_statusLabel->setStyleSheet("QLabel { color: #808080; font-size: 11px; }");
+    btnRow->addWidget(m_statusLabel);
+    btnRow->addStretch();
+
+    m_connectBtn = new QPushButton(m_client->isConnected() ? "Disconnect" : "Connect");
+    m_connectBtn->setFixedWidth(100);
+    m_connectBtn->setStyleSheet(
+        "QPushButton { background: #00b4d8; color: #0f0f1a; font-weight: bold; "
+        "border: 1px solid #008ba8; padding: 4px; border-radius: 3px; }"
+        "QPushButton:hover { background: #00c8f0; }"
+        "QPushButton:disabled { background: #404060; color: #808080; }");
+    connect(m_connectBtn, &QPushButton::clicked, this, [this] {
+        if (m_client->isConnected()) {
+            emit disconnectRequested();
+            return;
+        }
+        QString host = m_hostEdit->text().trimmed();
+        QString call = m_callEdit->text().trimmed().toUpper();
+        quint16 port = static_cast<quint16>(m_portSpin->value());
+        if (host.isEmpty() || call.isEmpty()) {
+            m_statusLabel->setText("Server and callsign are required");
+            m_statusLabel->setStyleSheet("QLabel { color: #ff4444; font-size: 11px; }");
+            return;
+        }
+        auto& s = AppSettings::instance();
+        s.setValue("DxClusterHost", host);
+        s.setValue("DxClusterPort", port);
+        s.setValue("DxClusterCallsign", call);
+        s.save();
+        emit connectRequested(host, port, call);
+    });
+    btnRow->addWidget(m_connectBtn);
+    connLayout->addLayout(btnRow);
+
+    layout->addWidget(connGroup);
+
+    // ── Console output ──────────────────────────────────────────────────
+    auto* consoleRow = new QHBoxLayout;
+    auto* consoleLabel = new QLabel("Cluster Console");
+    consoleLabel->setStyleSheet("QLabel { color: #00b4d8; font-weight: bold; }");
+    consoleRow->addWidget(consoleLabel);
+    consoleRow->addStretch();
+
+    auto* dxcColorLabel = new QLabel("Spot Color:");
+    dxcColorLabel->setStyleSheet("QLabel { color: #808080; font-size: 12px; }");
+    consoleRow->addWidget(dxcColorLabel);
+
+    QColor dxcColor(s.value("DxClusterSpotColor", "#D2B48C").toString());
+    auto* dxcColorBtn = new QPushButton;
+    dxcColorBtn->setFixedSize(18, 18);
+    dxcColorBtn->setStyleSheet(QString(
+        "QPushButton { background: %1; border: 2px solid #405060; border-radius: 3px; }"
+        "QPushButton:hover { border-color: #c8d8e8; }").arg(dxcColor.name()));
+    connect(dxcColorBtn, &QPushButton::clicked, this, [this, dxcColorBtn] {
+        QColor c = QColorDialog::getColor(
+            QColor(AppSettings::instance().value("DxClusterSpotColor", "#D2B48C").toString()),
+            this, "DX Cluster Spot Color");
+        if (c.isValid()) {
+            dxcColorBtn->setStyleSheet(QString(
+                "QPushButton { background: %1; border: 2px solid #405060; border-radius: 3px; }"
+                "QPushButton:hover { border-color: #c8d8e8; }").arg(c.name()));
+            AppSettings::instance().setValue("DxClusterSpotColor", c.name());
+            AppSettings::instance().save();
+        }
+    });
+    consoleRow->addWidget(dxcColorBtn);
+    layout->addLayout(consoleRow);
+
+    m_console = new QPlainTextEdit;
+    m_console->setReadOnly(true);
+    m_console->setMaximumBlockCount(2000);
+    m_console->setStyleSheet(
+        "QPlainTextEdit {"
+        "  background: #0a0a14;"
+        "  color: #a0b0c0;"
+        "  font-family: monospace;"
+        "  font-size: 11px;"
+        "  border: 1px solid #203040;"
+        "  padding: 4px;"
+        "}");
+    layout->addWidget(m_console, 1);
+
+    // Command input row
+    auto* cmdRow = new QHBoxLayout;
+    m_cmdEdit = new QLineEdit;
+    m_cmdEdit->setPlaceholderText("Type a cluster command (e.g. sh/dx 20, set/filter, bye)");
+    m_cmdEdit->setStyleSheet("QLineEdit { background: #1a1a2e; color: #c8d8e8; border: 1px solid #203040; padding: 3px; font-family: monospace; }");
+    m_cmdEdit->setEnabled(m_client->isConnected());
+    connect(m_cmdEdit, &QLineEdit::returnPressed, this, [this] {
+        QString cmd = m_cmdEdit->text().trimmed();
+        if (cmd.isEmpty() || !m_client->isConnected()) return;
+        QMetaObject::invokeMethod(m_client, [client=m_client, cmd] { client->sendCommand(cmd); });
+        m_console->appendPlainText("> " + cmd);
+        m_cmdEdit->clear();
+    });
+    m_sendBtn = new QPushButton("Send");
+    m_sendBtn->setFixedWidth(60);
+    m_sendBtn->setEnabled(m_client->isConnected());
+    connect(m_sendBtn, &QPushButton::clicked, this, [this] {
+        m_cmdEdit->returnPressed();
+    });
+    cmdRow->addWidget(m_cmdEdit, 1);
+    cmdRow->addWidget(m_sendBtn);
+    layout->addLayout(cmdRow);
+
+    tabs->addTab(page, "Cluster");
+}
+
+void DxClusterDialog::buildRbnTab(QTabWidget* tabs)
+{
+    auto* page = new QWidget;
+    auto* layout = new QVBoxLayout(page);
+    layout->setSpacing(8);
+
+    auto& s = AppSettings::instance();
+    QString defaultCall = s.value("RbnCallsign").toString();
+    if (defaultCall.isEmpty())
+        defaultCall = s.value("DxClusterCallsign").toString();
+
+    // ── Connection settings ─────────────────────────────────────────────
+    auto* connGroup = new QGroupBox("RBN Connection");
+    auto* connLayout = new QVBoxLayout(connGroup);
+    connLayout->setSpacing(4);
+
+    auto* grid = new QGridLayout;
+    grid->setColumnStretch(1, 1);
+    int row = 0;
+
+    grid->addWidget(new QLabel("Server:"), row, 0);
+    m_rbnHostEdit = new QLineEdit(s.value("RbnHost", "telnet.reversebeacon.net").toString());
+    m_rbnHostEdit->setPlaceholderText("telnet.reversebeacon.net");
+    m_rbnHostEdit->setStyleSheet("QLineEdit { background: #1a1a2e; color: #c8d8e8; border: 1px solid #203040; padding: 3px; }");
+    grid->addWidget(m_rbnHostEdit, row, 1);
+    row++;
+
+    grid->addWidget(new QLabel("Port:"), row, 0);
+    m_rbnPortSpin = new QSpinBox;
+    m_rbnPortSpin->setRange(1, 65535);
+    m_rbnPortSpin->setValue(s.value("RbnPort", 7000).toInt());
+    m_rbnPortSpin->setStyleSheet("QSpinBox { background: #1a1a2e; color: #c8d8e8; border: 1px solid #203040; padding: 3px; }");
+    grid->addWidget(m_rbnPortSpin, row, 1);
+    row++;
+
+    grid->addWidget(new QLabel("Callsign:"), row, 0);
+    m_rbnCallEdit = new QLineEdit(defaultCall);
+    m_rbnCallEdit->setPlaceholderText("your callsign");
+    m_rbnCallEdit->setStyleSheet("QLineEdit { background: #1a1a2e; color: #c8d8e8; border: 1px solid #203040; padding: 3px; }");
+    grid->addWidget(m_rbnCallEdit, row, 1);
+    row++;
+
+    // Rate limit
+    grid->addWidget(new QLabel("Rate Limit:"), row, 0);
+    auto* rateRow = new QHBoxLayout;
+    auto* rateSpin = new QSpinBox;
+    rateSpin->setRange(1, 100);
+    rateSpin->setValue(s.value("RbnRateLimit", 10).toInt());
+    rateSpin->setSuffix(" spots/sec");
+    rateSpin->setStyleSheet("QSpinBox { background: #1a1a2e; color: #c8d8e8; border: 1px solid #203040; padding: 3px; }");
+    connect(rateSpin, &QSpinBox::valueChanged, this, [](int v) {
+        auto& s = AppSettings::instance();
+        s.setValue("RbnRateLimit", v);
+        s.save();
+    });
+    rateRow->addWidget(rateSpin);
+    rateRow->addStretch();
+    grid->addLayout(rateRow, row, 1);
+    row++;
+
+    connLayout->addLayout(grid);
+
+    // Button row
+    auto* btnRow = new QHBoxLayout;
+    m_rbnAutoConnectBtn = new QPushButton(
+        s.value("RbnAutoConnect", "False").toString() == "True" ? "Auto-Connect: ON" : "Auto-Connect: OFF");
+    m_rbnAutoConnectBtn->setCheckable(true);
+    m_rbnAutoConnectBtn->setChecked(s.value("RbnAutoConnect", "False").toString() == "True");
+    m_rbnAutoConnectBtn->setStyleSheet(
+        "QPushButton { background: #206030; color: white; border: 1px solid #305040; padding: 4px 10px; }"
+        "QPushButton:!checked { background: #603020; }");
+    connect(m_rbnAutoConnectBtn, &QPushButton::toggled, this, [this](bool on) {
+        m_rbnAutoConnectBtn->setText(on ? "Auto-Connect: ON" : "Auto-Connect: OFF");
+        auto& s = AppSettings::instance();
+        s.setValue("RbnAutoConnect", on ? "True" : "False");
+        s.save();
+    });
+    btnRow->addWidget(m_rbnAutoConnectBtn);
+    btnRow->addStretch();
+
+    m_rbnStatusLabel = new QLabel("Disconnected");
+    m_rbnStatusLabel->setStyleSheet("QLabel { color: #808080; font-size: 11px; }");
+    btnRow->addWidget(m_rbnStatusLabel);
+    btnRow->addStretch();
+
+    m_rbnConnectBtn = new QPushButton(m_rbnClient->isConnected() ? "Disconnect" : "Connect");
+    m_rbnConnectBtn->setFixedWidth(100);
+    m_rbnConnectBtn->setStyleSheet(
+        "QPushButton { background: #00b4d8; color: #0f0f1a; font-weight: bold; "
+        "border: 1px solid #008ba8; padding: 4px; border-radius: 3px; }"
+        "QPushButton:hover { background: #00c8f0; }"
+        "QPushButton:disabled { background: #404060; color: #808080; }");
+    connect(m_rbnConnectBtn, &QPushButton::clicked, this, [this] {
+        if (m_rbnClient->isConnected()) {
+            emit rbnDisconnectRequested();
+            return;
+        }
+        QString host = m_rbnHostEdit->text().trimmed();
+        QString call = m_rbnCallEdit->text().trimmed().toUpper();
+        quint16 port = static_cast<quint16>(m_rbnPortSpin->value());
+        if (host.isEmpty() || call.isEmpty()) {
+            m_rbnStatusLabel->setText("Server and callsign are required");
+            m_rbnStatusLabel->setStyleSheet("QLabel { color: #ff4444; font-size: 11px; }");
+            return;
+        }
+        auto& s = AppSettings::instance();
+        s.setValue("RbnHost", host);
+        s.setValue("RbnPort", port);
+        s.setValue("RbnCallsign", call);
+        s.save();
+        emit rbnConnectRequested(host, port, call);
+    });
+    btnRow->addWidget(m_rbnConnectBtn);
+    connLayout->addLayout(btnRow);
+
+    layout->addWidget(connGroup);
+
+    // ── Console output ──────────────────────────────────────────────────
+    auto* rbnConsoleRow = new QHBoxLayout;
+    auto* rbnConsoleLabel = new QLabel("RBN Console");
+    rbnConsoleLabel->setStyleSheet("QLabel { color: #00b4d8; font-weight: bold; }");
+    rbnConsoleRow->addWidget(rbnConsoleLabel);
+    rbnConsoleRow->addStretch();
+
+    auto* rbnColorLabel = new QLabel("Spot Color:");
+    rbnColorLabel->setStyleSheet("QLabel { color: #808080; font-size: 12px; }");
+    rbnConsoleRow->addWidget(rbnColorLabel);
+
+    QColor rbnColor(s.value("RbnSpotColor", "#4488FF").toString());
+    auto* rbnColorBtn = new QPushButton;
+    rbnColorBtn->setFixedSize(18, 18);
+    rbnColorBtn->setStyleSheet(QString(
+        "QPushButton { background: %1; border: 2px solid #405060; border-radius: 3px; }"
+        "QPushButton:hover { border-color: #c8d8e8; }").arg(rbnColor.name()));
+    connect(rbnColorBtn, &QPushButton::clicked, this, [this, rbnColorBtn] {
+        QColor c = QColorDialog::getColor(
+            QColor(AppSettings::instance().value("RbnSpotColor", "#4488FF").toString()),
+            this, "RBN Spot Color");
+        if (c.isValid()) {
+            rbnColorBtn->setStyleSheet(QString(
+                "QPushButton { background: %1; border: 2px solid #405060; border-radius: 3px; }"
+                "QPushButton:hover { border-color: #c8d8e8; }").arg(c.name()));
+            AppSettings::instance().setValue("RbnSpotColor", c.name());
+            AppSettings::instance().save();
+        }
+    });
+    rbnConsoleRow->addWidget(rbnColorBtn);
+    layout->addLayout(rbnConsoleRow);
+
+    m_rbnConsole = new QPlainTextEdit;
+    m_rbnConsole->setReadOnly(true);
+    m_rbnConsole->setMaximumBlockCount(2000);
+    m_rbnConsole->setStyleSheet(
+        "QPlainTextEdit {"
+        "  background: #0a0a14;"
+        "  color: #a0b0c0;"
+        "  font-family: monospace;"
+        "  font-size: 11px;"
+        "  border: 1px solid #203040;"
+        "  padding: 4px;"
+        "}");
+    layout->addWidget(m_rbnConsole, 1);
+
+    // Command input row
+    auto* cmdRow = new QHBoxLayout;
+    m_rbnCmdEdit = new QLineEdit;
+    m_rbnCmdEdit->setPlaceholderText("Type an RBN command (e.g. set/skimmer, set/ft8, bye)");
+    m_rbnCmdEdit->setStyleSheet("QLineEdit { background: #1a1a2e; color: #c8d8e8; border: 1px solid #203040; padding: 3px; font-family: monospace; }");
+    m_rbnCmdEdit->setEnabled(m_rbnClient->isConnected());
+    connect(m_rbnCmdEdit, &QLineEdit::returnPressed, this, [this] {
+        QString cmd = m_rbnCmdEdit->text().trimmed();
+        if (cmd.isEmpty() || !m_rbnClient->isConnected()) return;
+        QMetaObject::invokeMethod(m_rbnClient, [client=m_rbnClient, cmd] { client->sendCommand(cmd); });
+        m_rbnConsole->appendPlainText("> " + cmd);
+        m_rbnCmdEdit->clear();
+    });
+    m_rbnSendBtn = new QPushButton("Send");
+    m_rbnSendBtn->setFixedWidth(60);
+    m_rbnSendBtn->setEnabled(m_rbnClient->isConnected());
+    connect(m_rbnSendBtn, &QPushButton::clicked, this, [this] {
+        m_rbnCmdEdit->returnPressed();
+    });
+    cmdRow->addWidget(m_rbnCmdEdit, 1);
+    cmdRow->addWidget(m_rbnSendBtn);
+    layout->addLayout(cmdRow);
+
+    tabs->addTab(page, "RBN");
+}
+
+void DxClusterDialog::buildDigitalSpotTab(QTabWidget* tabs)
+{
+    auto* page = new QWidget;
+    auto* layout = new QVBoxLayout(page);
+    layout->setSpacing(8);
+
+    auto& s = AppSettings::instance();
+    auto* infoLabel = new QLabel(
+        QStringLiteral("Native digital-mode spots from the in-process FT8/FT4/PSK/RTTY decoders.\n"
+                       "Per-mode Spot and PSK Reporter upload toggles are controlled in each decode window."));
+    infoLabel->setWordWrap(true);
+    infoLabel->setStyleSheet("QLabel { color: #a0b0c0; padding: 6px 2px; }");
+    layout->addWidget(infoLabel);
+
+    auto* decodeRow = new QHBoxLayout;
+    auto* consoleLabel = new QLabel("Digital Spot Feed");
+    consoleLabel->setStyleSheet("QLabel { color: #00b4d8; font-weight: bold; }");
+    decodeRow->addWidget(consoleLabel);
+    decodeRow->addStretch();
+
+    auto* lifeLabel = new QLabel("Spot Life:");
+    lifeLabel->setStyleSheet("QLabel { color: #808080; font-size: 12px; }");
+    decodeRow->addWidget(lifeLabel);
+
+    const int digitalLife = s.contains(QStringLiteral("DigitalSpotLifetime"))
+        ? std::max(30, s.value(QStringLiteral("DigitalSpotLifetime"), 120).toInt())
+        : std::max(30, s.value(QStringLiteral("WsjtxSpotLifetime"), 120).toInt());
+    auto* digitalLifeSlider = new GuardedSlider(Qt::Horizontal);
+    digitalLifeSlider->setRange(30, 300);
+    digitalLifeSlider->setValue(digitalLife);
+    digitalLifeSlider->setFixedWidth(120);
+    decodeRow->addWidget(digitalLifeSlider);
+
+    auto* digitalLifeValue = new QLabel(QString("%1s").arg(digitalLife));
+    digitalLifeValue->setFixedWidth(35);
+    digitalLifeValue->setAlignment(Qt::AlignRight);
+    digitalLifeValue->setStyleSheet("QLabel { color: #a0b0c0; font-size: 12px; }");
+    decodeRow->addWidget(digitalLifeValue);
+
+    connect(digitalLifeSlider, &QSlider::valueChanged, this, [digitalLifeValue](int v) {
+        digitalLifeValue->setText(QString("%1s").arg(v));
+        auto& s = AppSettings::instance();
+        s.setValue(QStringLiteral("DigitalSpotLifetime"), v);
+        s.save();
+    });
+    layout->addLayout(decodeRow);
+
+    m_digitalConsole = new QPlainTextEdit;
+    m_digitalConsole->setReadOnly(true);
+    m_digitalConsole->setMaximumBlockCount(2000);
+    m_digitalConsole->setStyleSheet(
+        "QPlainTextEdit {"
+        "  background: #0a0a14;"
+        "  color: #a0b0c0;"
+        "  font-family: monospace;"
+        "  font-size: 11px;"
+        "  border: 1px solid #203040;"
+        "  padding: 4px;"
+        "}");
+    layout->addWidget(m_digitalConsole, 1);
+
+    tabs->addTab(page, "Digital");
+}
+
+void DxClusterDialog::buildSpotCollectorTab(QTabWidget* tabs)
+{
+    auto* page = new QWidget;
+    auto* layout = new QVBoxLayout(page);
+    layout->setSpacing(8);
+
+    auto& s = AppSettings::instance();
+
+    // ── Connection settings ─────────────────────────────────────────────
+    auto* connGroup = new QGroupBox("SpotCollector UDP Listener");
+    auto* connLayout = new QVBoxLayout(connGroup);
+    connLayout->setSpacing(4);
+
+    auto* grid = new QGridLayout;
+    grid->setColumnStretch(1, 1);
+
+    grid->addWidget(new QLabel("UDP Port:"), 0, 0);
+    m_scPortSpin = new QSpinBox;
+    m_scPortSpin->setRange(1, 65535);
+    m_scPortSpin->setValue(s.value("SpotCollectorPort", 9999).toInt());
+    m_scPortSpin->setStyleSheet("QSpinBox { background: #1a1a2e; color: #c8d8e8; border: 1px solid #203040; padding: 3px; }");
+    grid->addWidget(m_scPortSpin, 0, 1);
+
+    connLayout->addLayout(grid);
+
+    auto* helpLabel = new QLabel(
+        "Receives DX spots from DXLab SpotCollector via UDP push.\n"
+        "In SpotCollector, enable UDP broadcast to this port (default 9999).\n"
+        "Alternatively, use the DX Cluster tab to connect to SpotCollector's telnet interface.");
+    helpLabel->setWordWrap(true);
+    helpLabel->setStyleSheet("QLabel { color: #8aa8c0; font-size: 11px; }");
+    connLayout->addWidget(helpLabel);
+
+    // Button row
+    auto* btnRow = new QHBoxLayout;
+    m_scAutoStartBtn = new QPushButton(
+        s.value("SpotCollectorAutoStart", "False").toString() == "True" ? "Auto-Start: ON" : "Auto-Start: OFF");
+    m_scAutoStartBtn->setCheckable(true);
+    m_scAutoStartBtn->setChecked(s.value("SpotCollectorAutoStart", "False").toString() == "True");
+    m_scAutoStartBtn->setStyleSheet(
+        "QPushButton { background: #206030; color: white; border: 1px solid #305040; padding: 4px 10px; }"
+        "QPushButton:!checked { background: #603020; }");
+    connect(m_scAutoStartBtn, &QPushButton::toggled, this, [this](bool on) {
+        m_scAutoStartBtn->setText(on ? "Auto-Start: ON" : "Auto-Start: OFF");
+        auto& s = AppSettings::instance();
+        s.setValue("SpotCollectorAutoStart", on ? "True" : "False");
+        s.save();
+    });
+    btnRow->addWidget(m_scAutoStartBtn);
+    btnRow->addStretch();
+
+    m_scStatusLabel = new QLabel("Stopped");
+    m_scStatusLabel->setStyleSheet("QLabel { color: #808080; font-size: 11px; }");
+    btnRow->addWidget(m_scStatusLabel);
+    btnRow->addStretch();
+
+    m_scStartBtn = new QPushButton(m_spotCollectorClient->isListening() ? "Stop" : "Start");
+    m_scStartBtn->setFixedWidth(100);
+    m_scStartBtn->setStyleSheet(
+        "QPushButton { background: #00b4d8; color: #0f0f1a; font-weight: bold; "
+        "border: 1px solid #008ba8; padding: 4px; border-radius: 3px; }"
+        "QPushButton:hover { background: #00c8f0; }"
+        "QPushButton:disabled { background: #404060; color: #808080; }");
+    connect(m_scStartBtn, &QPushButton::clicked, this, [this] {
+        if (m_spotCollectorClient->isListening()) {
+            emit spotCollectorStopRequested();
+            return;
+        }
+        quint16 port = static_cast<quint16>(m_scPortSpin->value());
+        auto& s = AppSettings::instance();
+        s.setValue("SpotCollectorPort", port);
+        s.save();
+        emit spotCollectorStartRequested(port);
+    });
+    btnRow->addWidget(m_scStartBtn);
+    connLayout->addLayout(btnRow);
+
+    layout->addWidget(connGroup);
+
+    // ── Console output ──────────────────────────────────────────────────
+    auto* consoleLabel = new QLabel("SpotCollector Spots");
+    consoleLabel->setStyleSheet("QLabel { color: #00b4d8; font-weight: bold; }");
+    layout->addWidget(consoleLabel);
+
+    m_scConsole = new QPlainTextEdit;
+    m_scConsole->setReadOnly(true);
+    m_scConsole->setMaximumBlockCount(2000);
+    m_scConsole->setStyleSheet(
+        "QPlainTextEdit {"
+        "  background: #0a0a14;"
+        "  color: #a0b0c0;"
+        "  font-family: monospace;"
+        "  font-size: 11px;"
+        "  border: 1px solid #203040;"
+        "  padding: 4px;"
+        "}");
+    layout->addWidget(m_scConsole, 1);
+
+    // Update status if already listening
+    if (m_spotCollectorClient->isListening()) {
+        m_scStatusLabel->setText(QString("Listening on port %1").arg(m_scPortSpin->value()));
+        m_scStatusLabel->setStyleSheet("QLabel { color: #00b4d8; font-size: 11px; }");
+        m_scStartBtn->setText("Stop");
+    }
+
+    tabs->addTab(page, "SpotCollector");
+}
+
+void DxClusterDialog::buildPotaTab(QTabWidget* tabs)
+{
+    auto* page = new QWidget;
+    auto* layout = new QVBoxLayout(page);
+    layout->setSpacing(8);
+
+    auto& s = AppSettings::instance();
+
+    // ── Settings ────────────────────────────────────────────────────────
+    auto* connGroup = new QGroupBox("POTA Spot Feed");
+    auto* connLayout = new QVBoxLayout(connGroup);
+    connLayout->setSpacing(4);
+
+    auto* grid = new QGridLayout;
+    grid->setColumnStretch(1, 1);
+    int row = 0;
+
+    grid->addWidget(new QLabel("Server:"), row, 0);
+    auto* serverLabel = new QLabel("api.pota.app (HTTP polling)");
+    serverLabel->setStyleSheet("QLabel { color: #808890; }");
+    grid->addWidget(serverLabel, row, 1);
+    row++;
+
+    grid->addWidget(new QLabel("Poll Interval:"), row, 0);
+    m_potaIntervalSpin = new QSpinBox;
+    m_potaIntervalSpin->setRange(15, 300);
+    m_potaIntervalSpin->setValue(s.value("PotaPollInterval", 30).toInt());
+    m_potaIntervalSpin->setSuffix(" sec");
+    m_potaIntervalSpin->setStyleSheet("QSpinBox { background: #1a1a2e; color: #c8d8e8; border: 1px solid #203040; padding: 3px; }");
+    connect(m_potaIntervalSpin, &QSpinBox::valueChanged, this, [](int v) {
+        auto& s = AppSettings::instance();
+        s.setValue("PotaPollInterval", v);
+        s.save();
+    });
+    grid->addWidget(m_potaIntervalSpin, row, 1);
+    row++;
+
+    connLayout->addLayout(grid);
+
+    // Button row
+    auto* btnRow = new QHBoxLayout;
+    m_potaAutoStartBtn = new QPushButton(
+        s.value("PotaAutoStart", "False").toString() == "True" ? "Auto-Start: ON" : "Auto-Start: OFF");
+    m_potaAutoStartBtn->setCheckable(true);
+    m_potaAutoStartBtn->setChecked(s.value("PotaAutoStart", "False").toString() == "True");
+    m_potaAutoStartBtn->setStyleSheet(
+        "QPushButton { background: #206030; color: white; border: 1px solid #305040; padding: 4px 10px; }"
+        "QPushButton:!checked { background: #603020; }");
+    connect(m_potaAutoStartBtn, &QPushButton::toggled, this, [this](bool on) {
+        m_potaAutoStartBtn->setText(on ? "Auto-Start: ON" : "Auto-Start: OFF");
+        auto& s = AppSettings::instance();
+        s.setValue("PotaAutoStart", on ? "True" : "False");
+        s.save();
+    });
+    btnRow->addWidget(m_potaAutoStartBtn);
+    btnRow->addStretch();
+
+    m_potaStatusLabel = new QLabel("Stopped");
+    m_potaStatusLabel->setStyleSheet("QLabel { color: #808080; font-size: 11px; }");
+    btnRow->addWidget(m_potaStatusLabel);
+    btnRow->addStretch();
+
+    m_potaStartBtn = new QPushButton(m_potaClient->isPolling() ? "Stop" : "Start");
+    m_potaStartBtn->setFixedWidth(100);
+    m_potaStartBtn->setStyleSheet(
+        "QPushButton { background: #00b4d8; color: #0f0f1a; font-weight: bold; "
+        "border: 1px solid #008ba8; padding: 4px; border-radius: 3px; }"
+        "QPushButton:hover { background: #00c8f0; }"
+        "QPushButton:disabled { background: #404060; color: #808080; }");
+    connect(m_potaStartBtn, &QPushButton::clicked, this, [this] {
+        if (m_potaClient->isPolling()) {
+            emit potaStopRequested();
+            return;
+        }
+        int interval = m_potaIntervalSpin->value();
+        auto& s = AppSettings::instance();
+        s.setValue("PotaPollInterval", interval);
+        s.save();
+        emit potaStartRequested(interval);
+    });
+    btnRow->addWidget(m_potaStartBtn);
+    connLayout->addLayout(btnRow);
+
+    layout->addWidget(connGroup);
+
+    // ── Console output ──────────────────────────────────────────────────
+    auto* consoleRow = new QHBoxLayout;
+    auto* consoleLabel = new QLabel("POTA Activations");
+    consoleLabel->setStyleSheet("QLabel { color: #00b4d8; font-weight: bold; }");
+    consoleRow->addWidget(consoleLabel);
+    consoleRow->addStretch();
+
+    auto* spotColorLabel = new QLabel("Spot Color:");
+    spotColorLabel->setStyleSheet("QLabel { color: #808080; font-size: 12px; }");
+    consoleRow->addWidget(spotColorLabel);
+
+    QColor potaColor(s.value("PotaSpotColor", "#FFFF00").toString());
+    auto* potaColorBtn = new QPushButton;
+    potaColorBtn->setFixedSize(18, 18);
+    potaColorBtn->setStyleSheet(QString(
+        "QPushButton { background: %1; border: 2px solid #405060; border-radius: 3px; }"
+        "QPushButton:hover { border-color: #c8d8e8; }").arg(potaColor.name()));
+    connect(potaColorBtn, &QPushButton::clicked, this, [this, potaColorBtn] {
+        QColor c = QColorDialog::getColor(
+            QColor(AppSettings::instance().value("PotaSpotColor", "#FFFF00").toString()),
+            this, "POTA Spot Color");
+        if (c.isValid()) {
+            potaColorBtn->setStyleSheet(QString(
+                "QPushButton { background: %1; border: 2px solid #405060; border-radius: 3px; }"
+                "QPushButton:hover { border-color: #c8d8e8; }").arg(c.name()));
+            AppSettings::instance().setValue("PotaSpotColor", c.name());
+            AppSettings::instance().save();
+        }
+    });
+    consoleRow->addWidget(potaColorBtn);
+    layout->addLayout(consoleRow);
+
+    m_potaConsole = new QPlainTextEdit;
+    m_potaConsole->setReadOnly(true);
+    m_potaConsole->setMaximumBlockCount(2000);
+    m_potaConsole->setStyleSheet(
+        "QPlainTextEdit {"
+        "  background: #0a0a14;"
+        "  color: #a0b0c0;"
+        "  font-family: monospace;"
+        "  font-size: 11px;"
+        "  border: 1px solid #203040;"
+        "  padding: 4px;"
+        "}");
+    layout->addWidget(m_potaConsole, 1);
+
+    tabs->addTab(page, "POTA");
+}
+
+#ifdef HAVE_WEBSOCKETS
+void DxClusterDialog::buildFreeDvTab(QTabWidget* tabs)
+{
+    auto* page = new QWidget;
+    auto* layout = new QVBoxLayout(page);
+    layout->setSpacing(8);
+
+    auto& s = AppSettings::instance();
+
+    // ── Settings ────────────────────────────────────────────────────────
+    auto* connGroup = new QGroupBox("FreeDV QSO Reporter");
+    auto* connLayout = new QVBoxLayout(connGroup);
+    connLayout->setSpacing(4);
+
+    auto* grid = new QGridLayout;
+    grid->setColumnStretch(1, 1);
+    int row = 0;
+
+    grid->addWidget(new QLabel("Server:"), row, 0);
+    auto* serverLabel = new QLabel("qso.freedv.org (WebSocket)");
+    serverLabel->setStyleSheet("QLabel { color: #808890; }");
+    grid->addWidget(serverLabel, row, 1);
+    row++;
+
+    connLayout->addLayout(grid);
+
+    // Button row
+    auto* btnRow = new QHBoxLayout;
+    m_freedvAutoStartBtn = new QPushButton(
+        s.value("FreeDvAutoStart", "False").toString() == "True" ? "Auto-Start: ON" : "Auto-Start: OFF");
+    m_freedvAutoStartBtn->setCheckable(true);
+    m_freedvAutoStartBtn->setChecked(s.value("FreeDvAutoStart", "False").toString() == "True");
+    m_freedvAutoStartBtn->setStyleSheet(
+        "QPushButton { background: #206030; color: white; border: 1px solid #305040; padding: 4px 10px; }"
+        "QPushButton:!checked { background: #603020; }");
+    connect(m_freedvAutoStartBtn, &QPushButton::toggled, this, [this](bool on) {
+        m_freedvAutoStartBtn->setText(on ? "Auto-Start: ON" : "Auto-Start: OFF");
+        auto& s = AppSettings::instance();
+        s.setValue("FreeDvAutoStart", on ? "True" : "False");
+        s.save();
+    });
+    btnRow->addWidget(m_freedvAutoStartBtn);
+    btnRow->addStretch();
+
+    m_freedvStatusLabel = new QLabel("Stopped");
+    m_freedvStatusLabel->setStyleSheet("QLabel { color: #808080; font-size: 11px; }");
+    btnRow->addWidget(m_freedvStatusLabel);
+    btnRow->addStretch();
+
+    m_freedvStartBtn = new QPushButton(m_freedvClient->isConnected() ? "Stop" : "Start");
+    m_freedvStartBtn->setFixedWidth(100);
+    m_freedvStartBtn->setStyleSheet(
+        "QPushButton { background: #00b4d8; color: #0f0f1a; font-weight: bold; "
+        "border: 1px solid #008ba8; padding: 4px; border-radius: 3px; }"
+        "QPushButton:hover { background: #00c8f0; }"
+        "QPushButton:disabled { background: #404060; color: #808080; }");
+    connect(m_freedvStartBtn, &QPushButton::clicked, this, [this] {
+        if (m_freedvClient->isConnected()) {
+            emit freedvStopRequested();
+            return;
+        }
+        emit freedvStartRequested();
+    });
+    btnRow->addWidget(m_freedvStartBtn);
+    connLayout->addLayout(btnRow);
+
+    layout->addWidget(connGroup);
+
+    // ── Console output ──────────────────────────────────────────────────
+    auto* consoleRow = new QHBoxLayout;
+    auto* consoleLabel = new QLabel("FreeDV Spots");
+    consoleLabel->setStyleSheet("QLabel { color: #00b4d8; font-weight: bold; }");
+    consoleRow->addWidget(consoleLabel);
+    consoleRow->addStretch();
+
+    auto* spotColorLabel = new QLabel("Spot Color:");
+    spotColorLabel->setStyleSheet("QLabel { color: #808080; font-size: 12px; }");
+    consoleRow->addWidget(spotColorLabel);
+
+    QColor freedvColor(s.value("FreeDvSpotColor", "#FF8C00").toString());
+    auto* freedvColorBtn = new QPushButton;
+    freedvColorBtn->setFixedSize(18, 18);
+    freedvColorBtn->setStyleSheet(QString(
+        "QPushButton { background: %1; border: 2px solid #405060; border-radius: 3px; }"
+        "QPushButton:hover { border-color: #c8d8e8; }").arg(freedvColor.name()));
+    connect(freedvColorBtn, &QPushButton::clicked, this, [this, freedvColorBtn] {
+        QColor c = QColorDialog::getColor(
+            QColor(AppSettings::instance().value("FreeDvSpotColor", "#FF8C00").toString()),
+            this, "FreeDV Spot Color");
+        if (c.isValid()) {
+            freedvColorBtn->setStyleSheet(QString(
+                "QPushButton { background: %1; border: 2px solid #405060; border-radius: 3px; }"
+                "QPushButton:hover { border-color: #c8d8e8; }").arg(c.name()));
+            AppSettings::instance().setValue("FreeDvSpotColor", c.name());
+            AppSettings::instance().save();
+        }
+    });
+    consoleRow->addWidget(freedvColorBtn);
+    layout->addLayout(consoleRow);
+
+    m_freedvConsole = new QPlainTextEdit;
+    m_freedvConsole->setReadOnly(true);
+    m_freedvConsole->setMaximumBlockCount(2000);
+    m_freedvConsole->setStyleSheet(
+        "QPlainTextEdit {"
+        "  background: #0a0a14;"
+        "  color: #a0b0c0;"
+        "  font-family: monospace;"
+        "  font-size: 11px;"
+        "  border: 1px solid #203040;"
+        "  padding: 4px;"
+        "}");
+    layout->addWidget(m_freedvConsole, 1);
+
+    tabs->addTab(page, "FreeDV");
+}
+#endif
+
+void DxClusterDialog::buildSpotListTab(QTabWidget* tabs)
+{
+    auto* page = new QWidget;
+    auto* layout = new QVBoxLayout(page);
+    layout->setSpacing(4);
+
+    // Band filter checkboxes
+    auto* filterRow = new QHBoxLayout;
+    filterRow->setSpacing(2);
+    auto* filterLabel = new QLabel("Bands:");
+    filterLabel->setStyleSheet("QLabel { color: #808080; font-size: 13px; }");
+    filterRow->addWidget(filterLabel);
+
+    // Table model + band filter proxy
+    m_spotModel = new SpotTableModel(this);
+    m_proxyModel = new BandFilterProxy(this);
+    m_proxyModel->setSourceModel(m_spotModel);
+    m_proxyModel->setSortRole(Qt::UserRole);
+
+    static constexpr const char* bands[] = {
+        "160m", "80m", "60m", "40m", "30m", "20m", "17m", "15m", "12m", "10m", "6m"
+    };
+    QString cbStyle =
+        "QCheckBox { color: #a0b0c0; font-size: 12px; spacing: 3px; }"
+        "QCheckBox::indicator { width: 13px; height: 13px; }";
+    auto& sf = AppSettings::instance();
+    for (const char* band : bands) {
+        auto* cb = new QCheckBox(band);
+        QString key = QString("SpotBandFilter_%1").arg(band);
+        bool on = sf.value(key, "True").toString() == "True";
+        cb->setChecked(on);
+        if (!on)
+            m_proxyModel->setBandVisible(QString(band), false);
+        cb->setStyleSheet(cbStyle);
+        connect(cb, &QCheckBox::toggled, this, [this, b = QString(band), key](bool on) {
+            m_proxyModel->setBandVisible(b, on);
+            auto& s = AppSettings::instance();
+            s.setValue(key, on ? "True" : "False");
+            s.save();
+        });
+        filterRow->addWidget(cb, 1);  // equal stretch across row
+    }
+    layout->addLayout(filterRow);
+
+    m_spotTable = new QTableView;
+    m_spotTable->setModel(m_proxyModel);
+    m_spotTable->setSortingEnabled(true);
+    m_spotTable->setSelectionBehavior(QAbstractItemView::SelectRows);
+    m_spotTable->setSelectionMode(QAbstractItemView::SingleSelection);
+    m_spotTable->setAlternatingRowColors(true);
+    m_spotTable->verticalHeader()->setVisible(false);
+    m_spotTable->verticalHeader()->setDefaultSectionSize(20);
+    m_spotTable->horizontalHeader()->setStretchLastSection(true);
+    m_spotTable->setStyleSheet(
+        "QTableView {"
+        "  background: #0a0a14;"
+        "  alternate-background-color: #0f0f1e;"
+        "  color: #c8d8e8;"
+        "  gridline-color: #1a2a3a;"
+        "  border: 1px solid #203040;"
+        "  font-size: 11px;"
+        "}"
+        "QTableView::item:selected {"
+        "  background: #1a3a5a;"
+        "  color: #e0f0ff;"
+        "}"
+        "QHeaderView::section {"
+        "  background: #1a1a2e;"
+        "  color: #00b4d8;"
+        "  border: 1px solid #203040;"
+        "  padding: 3px 6px;"
+        "  font-weight: bold;"
+        "  font-size: 11px;"
+        "}");
+
+    // Column widths
+    m_spotTable->setColumnWidth(SpotTableModel::ColTime, 50);
+    m_spotTable->setColumnWidth(SpotTableModel::ColFreq, 80);
+    m_spotTable->setColumnWidth(SpotTableModel::ColDxCall, 90);
+    m_spotTable->setColumnWidth(SpotTableModel::ColMode, 45);
+    m_spotTable->setColumnWidth(SpotTableModel::ColComment, 200);
+    m_spotTable->setColumnWidth(SpotTableModel::ColSpotter, 80);
+    m_spotTable->setColumnWidth(SpotTableModel::ColBand, 45);
+    m_spotTable->setColumnWidth(SpotTableModel::ColSource, 55);
+
+    // No default sort — insertion order is newest-first
+    m_spotTable->horizontalHeader()->setSortIndicatorShown(false);
+
+    // Double-click to tune
+    connect(m_spotTable, &QTableView::doubleClicked, this, [this](const QModelIndex& idx) {
+        auto srcIdx = m_proxyModel->mapToSource(idx);
+        double freq = m_spotModel->freqAtRow(srcIdx.row());
+        if (freq > 0.0)
+            emit tuneRequested(freq);
+    });
+
+    layout->addWidget(m_spotTable, 1);
+
+    // Bottom bar: spot count + clear
+    auto* bottomRow = new QHBoxLayout;
+    auto* countLabel = new QLabel("0 spots");
+    countLabel->setStyleSheet("QLabel { color: #808080; font-size: 11px; }");
+    connect(m_spotModel, &QAbstractTableModel::rowsInserted, this, [this, countLabel] {
+        countLabel->setText(QString("%1 spots").arg(m_spotModel->rowCount()));
+    });
+    bottomRow->addWidget(countLabel);
+    bottomRow->addStretch();
+
+    auto* clearBtn = new QPushButton("Clear");
+    clearBtn->setFixedWidth(60);
+    connect(clearBtn, &QPushButton::clicked, this, [this, countLabel] {
+        m_spotModel->clear();
+        countLabel->setText("0 spots");
+    });
+    bottomRow->addWidget(clearBtn);
+    layout->addLayout(bottomRow);
+
+    tabs->addTab(page, "Spot List");
+}
+
+void DxClusterDialog::buildDisplayTab(QTabWidget* tabs)
+{
+    auto* page = new QWidget;
+    auto* layout = new QVBoxLayout(page);
+    layout->setSpacing(8);
+
+    auto& s = AppSettings::instance();
+    bool spotsEnabled     = s.value("IsSpotsEnabled", "True").toString() == "True";
+    bool memoriesEnabled  = s.value("IsMemorySpotsEnabled", "False").toString() == "True";
+    bool overrideColors   = s.value("IsSpotsOverrideColorsEnabled", "False").toString() == "True";
+    bool overrideBg       = s.value("IsSpotsOverrideBackgroundColorsEnabled", "True").toString() == "True";
+    bool overrideBgAuto   = s.value("IsSpotsOverrideToAutoBackgroundColorEnabled", "True").toString() == "True";
+    int levels            = s.value("SpotsMaxLevel", 3).toInt();
+    int position          = s.value("SpotsStartingHeightPercentage", 50).toInt();
+    int fontSize          = s.value("SpotFontSize", 16).toInt();
+    int lifetimeSec       = s.value("DxClusterSpotLifetimeSec", 0).toInt();
+    if (lifetimeSec <= 0)
+        lifetimeSec = s.value("DxClusterSpotLifetime", 30).toInt() * 60;
+    QColor spotColor(s.value("SpotsOverrideColor", "#FFFF00").toString());
+    QColor bgColor(s.value("SpotsOverrideBgColor", "#000000").toString());
+    int bgOpacity         = s.value("SpotsBackgroundOpacity", 48).toInt();
+
+    auto* grid = new QGridLayout;
+    grid->setColumnStretch(1, 1);
+    int row = 0;
+
+    auto save = [this](const QString& key, const QVariant& val) {
+        auto& s = AppSettings::instance();
+        s.setValue(key, val);
+        s.save();
+        emit settingsChanged();
+    };
+
+    auto updateSwatch = [](QPushButton* btn, const QColor& color) {
+        btn->setStyleSheet(QString(
+            "QPushButton { background: %1; border: 2px solid #405060; border-radius: 3px; }"
+            "QPushButton:hover { border-color: #c8d8e8; }").arg(color.name()));
+    };
+
+    // ── Spots: Enabled/Disabled ─────────────────────────────────────────
+    grid->addWidget(new QLabel("Spots:"), row, 0);
+    auto* spotsToggle = new QPushButton(spotsEnabled ? "Enabled" : "Disabled");
+    spotsToggle->setCheckable(true);
+    spotsToggle->setChecked(spotsEnabled);
+    spotsToggle->setFixedWidth(80);
+    spotsToggle->setStyleSheet(
+        "QPushButton { background: #206030; color: white; border: 1px solid #305040; padding: 3px; }"
+        "QPushButton:!checked { background: #603020; }");
+    connect(spotsToggle, &QPushButton::toggled, this, [spotsToggle, save](bool on) {
+        spotsToggle->setText(on ? "Enabled" : "Disabled");
+        save("IsSpotsEnabled", on ? "True" : "False");
+    });
+    grid->addWidget(spotsToggle, row++, 1, Qt::AlignLeft);
+
+    // ── Memory feed visibility ──────────────────────────────────────────
+    grid->addWidget(new QLabel("Memories:"), row, 0);
+    auto* memoriesToggle = new QPushButton(memoriesEnabled ? "Enabled" : "Disabled");
+    memoriesToggle->setCheckable(true);
+    memoriesToggle->setChecked(memoriesEnabled);
+    memoriesToggle->setFixedWidth(80);
+    memoriesToggle->setToolTip(
+        "Show radio memory channels as a spot-like feed on the panadapter.");
+    memoriesToggle->setStyleSheet(
+        "QPushButton { background: #206030; color: white; border: 1px solid #305040; padding: 3px; }"
+        "QPushButton:!checked { background: #603020; }");
+    connect(memoriesToggle, &QPushButton::toggled, this, [memoriesToggle, save](bool on) {
+        memoriesToggle->setText(on ? "Enabled" : "Disabled");
+        save("IsMemorySpotsEnabled", on ? "True" : "False");
+    });
+    grid->addWidget(memoriesToggle, row++, 1, Qt::AlignLeft);
+
+    // ── Auto-switch mode on spot click (#424) ───────────────────────────
+    grid->addWidget(new QLabel("Auto Mode:"), row, 0);
+    bool autoMode = s.value("SpotAutoSwitchMode", "False").toString() == "True";
+    auto* autoModeToggle = new QPushButton(autoMode ? "Enabled" : "Disabled");
+    autoModeToggle->setCheckable(true);
+    autoModeToggle->setChecked(autoMode);
+    autoModeToggle->setFixedWidth(80);
+    autoModeToggle->setToolTip("Automatically switch slice mode when clicking a spot\nthat includes mode information (e.g. CW, FT8, RTTY)");
+    autoModeToggle->setStyleSheet(
+        "QPushButton { background: #206030; color: white; border: 1px solid #305040; padding: 3px; }"
+        "QPushButton:!checked { background: #603020; }");
+    connect(autoModeToggle, &QPushButton::toggled, this, [autoModeToggle, save](bool on) {
+        autoModeToggle->setText(on ? "Enabled" : "Disabled");
+        save("SpotAutoSwitchMode", on ? "True" : "False");
+    });
+    grid->addWidget(autoModeToggle, row++, 1, Qt::AlignLeft);
+
+    // ── Levels slider ───────────────────────────────────────────────────
+    grid->addWidget(new QLabel("Levels:"), row, 0);
+    auto* levelsRow = new QHBoxLayout;
+    auto* levelsSlider = new GuardedSlider(Qt::Horizontal);
+    levelsSlider->setRange(1, 10);
+    levelsSlider->setValue(levels);
+    auto* levelsValue = new QLabel(QString::number(levels));
+    levelsValue->setFixedWidth(24);
+    levelsValue->setAlignment(Qt::AlignRight);
+    levelsRow->addWidget(levelsSlider);
+    levelsRow->addWidget(levelsValue);
+    connect(levelsSlider, &QSlider::valueChanged, this, [levelsValue, save](int v) {
+        levelsValue->setText(QString::number(v));
+        save("SpotsMaxLevel", QString::number(v));
+    });
+    grid->addLayout(levelsRow, row++, 1);
+
+    // ── Position slider ─────────────────────────────────────────────────
+    grid->addWidget(new QLabel("Position:"), row, 0);
+    auto* posRow = new QHBoxLayout;
+    auto* posSlider = new GuardedSlider(Qt::Horizontal);
+    posSlider->setRange(0, 100);
+    posSlider->setValue(position);
+    auto* posValue = new QLabel(QString::number(position));
+    posValue->setFixedWidth(24);
+    posValue->setAlignment(Qt::AlignRight);
+    posRow->addWidget(posSlider);
+    posRow->addWidget(posValue);
+    connect(posSlider, &QSlider::valueChanged, this, [posValue, save](int v) {
+        posValue->setText(QString::number(v));
+        save("SpotsStartingHeightPercentage", QString::number(v));
+    });
+    grid->addLayout(posRow, row++, 1);
+
+    // ── Font Size slider ────────────────────────────────────────────────
+    grid->addWidget(new QLabel("Font Size:"), row, 0);
+    auto* fontRow = new QHBoxLayout;
+    auto* fontSlider = new GuardedSlider(Qt::Horizontal);
+    fontSlider->setRange(8, 32);
+    fontSlider->setValue(fontSize);
+    auto* fontValue = new QLabel(QString::number(fontSize));
+    fontValue->setFixedWidth(24);
+    fontValue->setAlignment(Qt::AlignRight);
+    fontRow->addWidget(fontSlider);
+    fontRow->addWidget(fontValue);
+    connect(fontSlider, &QSlider::valueChanged, this, [fontValue, save](int v) {
+        fontValue->setText(QString::number(v));
+        save("SpotFontSize", QString::number(v));
+    });
+    grid->addLayout(fontRow, row++, 1);
+
+    // ── Spot Lifetime slider (non-linear: seconds → minutes → hours) ──
+    grid->addWidget(new QLabel("Spot Lifetime:"), row, 0);
+    auto* lifeRow = new QHBoxLayout;
+
+    static QVector<int> lifeSteps;
+    if (lifeSteps.isEmpty()) {
+        for (int s = 10; s <= 55; s += 5)  lifeSteps.append(s);
+        for (int m = 5;  m <= 55; m += 5)  lifeSteps.append(m * 60);
+        for (int h = 1;  h <= 24; h++)      lifeSteps.append(h * 3600);
+    }
+    auto formatLifetime = [](int secs) -> QString {
+        if (secs < 60)   return QString("%1 sec").arg(secs);
+        if (secs < 3600) return QString("%1 min%2").arg(secs / 60).arg(secs / 60 == 1 ? "" : "s");
+        int hrs = secs / 3600;
+        if (hrs == 24) return QStringLiteral("1 day");
+        return QString("%1 hr%2").arg(hrs).arg(hrs == 1 ? "" : "s");
+    };
+    int lifeIdx = 0;
+    for (int i = 0; i < lifeSteps.size(); ++i)
+        if (std::abs(lifeSteps[i] - lifetimeSec) < std::abs(lifeSteps[lifeIdx] - lifetimeSec))
+            lifeIdx = i;
+
+    auto* lifeSlider = new GuardedSlider(Qt::Horizontal);
+    lifeSlider->setRange(0, lifeSteps.size() - 1);
+    lifeSlider->setValue(lifeIdx);
+    auto* lifeValue = new QLabel(formatLifetime(lifeSteps[lifeIdx]));
+    lifeValue->setFixedWidth(90);
+    lifeValue->setAlignment(Qt::AlignRight);
+    lifeRow->addWidget(lifeSlider);
+    lifeRow->addWidget(lifeValue);
+    connect(lifeSlider, &QSlider::valueChanged, this, [lifeValue, formatLifetime, save](int idx) {
+        int secs = lifeSteps.value(idx, 1800);
+        lifeValue->setText(formatLifetime(secs));
+        save("DxClusterSpotLifetimeSec", QString::number(secs));
+    });
+    grid->addLayout(lifeRow, row++, 1);
+
+    // ── Override Colors + color picker ──────────────────────────────────
+    grid->addWidget(new QLabel("Override Colors:"), row, 0);
+    auto* colorRow = new QHBoxLayout;
+    auto* overrideToggle = new QPushButton(overrideColors ? "Enabled" : "Disabled");
+    overrideToggle->setCheckable(true);
+    overrideToggle->setChecked(overrideColors);
+    overrideToggle->setFixedWidth(80);
+    overrideToggle->setStyleSheet(
+        "QPushButton { background: #206030; color: white; border: 1px solid #305040; padding: 3px; }"
+        "QPushButton:!checked { background: #603020; }");
+    connect(overrideToggle, &QPushButton::toggled, this, [overrideToggle, save](bool on) {
+        overrideToggle->setText(on ? "Enabled" : "Disabled");
+        save("IsSpotsOverrideColorsEnabled", on ? "True" : "False");
+    });
+    colorRow->addWidget(overrideToggle);
+
+    auto* colorBtn = new QPushButton;
+    colorBtn->setFixedSize(24, 24);
+    updateSwatch(colorBtn, spotColor);
+    connect(colorBtn, &QPushButton::clicked, this, [this, colorBtn, updateSwatch, save, spotColor]() mutable {
+        QColor c = QColorDialog::getColor(spotColor, this, "Spot Text Color");
+        if (c.isValid()) {
+            spotColor = c;
+            updateSwatch(colorBtn, c);
+            save("SpotsOverrideColor", c.name());
+        }
+    });
+    colorRow->addWidget(colorBtn);
+    colorRow->addStretch();
+    grid->addLayout(colorRow, row++, 1);
+
+    // ── Override Background + Auto + color picker ───────────────────────
+    grid->addWidget(new QLabel("Override Background:"), row, 0);
+    auto* bgRow = new QHBoxLayout;
+    QString bgStyle =
+        "QPushButton { background: #206030; color: white; border: 1px solid #305040; padding: 3px; }"
+        "QPushButton:!checked { background: #603020; }";
+    auto* bgEnabledBtn = new QPushButton("Enabled");
+    bgEnabledBtn->setCheckable(true);
+    bgEnabledBtn->setChecked(overrideBg);
+    bgEnabledBtn->setFixedWidth(70);
+    bgEnabledBtn->setStyleSheet(bgStyle);
+    auto* bgAutoBtn = new QPushButton("Auto");
+    bgAutoBtn->setCheckable(true);
+    bgAutoBtn->setChecked(overrideBgAuto);
+    bgAutoBtn->setFixedWidth(50);
+    bgAutoBtn->setStyleSheet(bgStyle);
+    connect(bgEnabledBtn, &QPushButton::toggled, this, [save](bool on) {
+        save("IsSpotsOverrideBackgroundColorsEnabled", on ? "True" : "False");
+    });
+    connect(bgAutoBtn, &QPushButton::toggled, this, [save](bool on) {
+        save("IsSpotsOverrideToAutoBackgroundColorEnabled", on ? "True" : "False");
+    });
+    bgRow->addWidget(bgEnabledBtn);
+    bgRow->addWidget(bgAutoBtn);
+
+    auto* bgColorBtn = new QPushButton;
+    bgColorBtn->setFixedSize(24, 24);
+    updateSwatch(bgColorBtn, bgColor);
+    connect(bgColorBtn, &QPushButton::clicked, this, [this, bgColorBtn, updateSwatch, save, bgColor]() mutable {
+        QColor c = QColorDialog::getColor(bgColor, this, "Spot Background Color");
+        if (c.isValid()) {
+            bgColor = c;
+            updateSwatch(bgColorBtn, c);
+            save("SpotsOverrideBgColor", c.name());
+        }
+    });
+    bgRow->addWidget(bgColorBtn);
+    bgRow->addStretch();
+    grid->addLayout(bgRow, row++, 1);
+
+    // ── Background Opacity slider ───────────────────────────────────────
+    grid->addWidget(new QLabel("Background Opacity:"), row, 0);
+    auto* opacRow = new QHBoxLayout;
+    auto* opacSlider = new GuardedSlider(Qt::Horizontal);
+    opacSlider->setRange(0, 100);
+    opacSlider->setValue(bgOpacity);
+    auto* opacValue = new QLabel(QString::number(bgOpacity));
+    opacValue->setFixedWidth(24);
+    opacValue->setAlignment(Qt::AlignRight);
+    opacRow->addWidget(opacSlider);
+    opacRow->addWidget(opacValue);
+    connect(opacSlider, &QSlider::valueChanged, this, [opacValue, save](int v) {
+        opacValue->setText(QString::number(v));
+        save("SpotsBackgroundOpacity", QString::number(v));
+    });
+    grid->addLayout(opacRow, row++, 1);
+
+    // ── Total Spots ─────────────────────────────────────────────────────
+    grid->addWidget(new QLabel("Total Spots:"), row, 0);
+    m_totalSpotsLabel = new QLabel("0");
+    m_totalSpotsLabel->setStyleSheet("QLabel { color: #c8d8e8; font-weight: bold; }");
+    grid->addWidget(m_totalSpotsLabel, row++, 1);
+
+    layout->addLayout(grid);
+
+    // ── DXCC Coloring section (#330) ────────────────────────────────────
+    {
+        auto* dxccTitle = new QLabel("DXCC Coloring");
+        dxccTitle->setAlignment(Qt::AlignCenter);
+        dxccTitle->setStyleSheet(
+            "QLabel { font-size: 13px; font-weight: bold; color: #80b0d0; "
+            "border-top: 1px solid #304050; padding-top: 8px; margin-top: 6px; }");
+        layout->addWidget(dxccTitle);
+
+        auto* dxccGrid = new QGridLayout;
+        dxccGrid->setColumnStretch(1, 1);
+        int drow = 0;
+
+        bool dxccEnabled = m_dxccProvider ? m_dxccProvider->isEnabled() : false;
+        auto* dxccToggle = new QPushButton(dxccEnabled ? "Enabled" : "Disabled");
+        dxccToggle->setCheckable(true);
+        dxccToggle->setChecked(dxccEnabled);
+        dxccToggle->setFixedWidth(80);
+        dxccToggle->setStyleSheet(
+            "QPushButton { background: #206030; color: white; border: 1px solid #305040; padding: 3px; }"
+            "QPushButton:!checked { background: #603020; }");
+        connect(dxccToggle, &QPushButton::toggled, this, [this, dxccToggle, save](bool on) {
+            dxccToggle->setText(on ? "Enabled" : "Disabled");
+            save("IsDxccColoringEnabled", on ? "True" : "False");
+            if (m_dxccProvider) m_dxccProvider->setEnabled(on);
+        });
+        dxccGrid->addWidget(new QLabel("DXCC Colors:"), drow, 0);
+        dxccGrid->addWidget(dxccToggle, drow++, 1, Qt::AlignLeft);
+
+        // ADIF file picker
+        const QString savedAdif = AppSettings::instance().value("DxccAdifFilePath", "").toString();
+        auto* adifPathLabel = new QLabel(savedAdif.isEmpty() ? "(none)" : QFileInfo(savedAdif).fileName());
+        adifPathLabel->setStyleSheet("QLabel { color: #90a8b8; font-size: 11px; }");
+        adifPathLabel->setMaximumWidth(200);
+        auto* browseBtn = new QPushButton("Browse\xe2\x80\xa6");
+        browseBtn->setFixedWidth(80);
+        auto* adifRow = new QHBoxLayout;
+        adifRow->addWidget(adifPathLabel);
+        adifRow->addWidget(browseBtn);
+        adifRow->addStretch();
+        dxccGrid->addWidget(new QLabel("Log File (ADIF):"), drow, 0);
+        dxccGrid->addLayout(adifRow, drow++, 1);
+
+        // Stats label
+        m_dxccStatsLabel = new QLabel(m_dxccProvider && m_dxccProvider->qsoCount() > 0
+            ? QString("%1 QSOs / %2 entities").arg(m_dxccProvider->qsoCount()).arg(m_dxccProvider->entityCount())
+            : "(no log loaded)");
+        m_dxccStatsLabel->setStyleSheet("QLabel { color: #90c890; font-size: 11px; }");
+        dxccGrid->addWidget(new QLabel("Imported:"), drow, 0);
+        dxccGrid->addWidget(m_dxccStatsLabel, drow++, 1);
+
+        // Colour swatches
+        auto* swatchRow = new QHBoxLayout;
+        struct SwatchDef { const char* tip; QColor* colPtr; const char* key; };
+        SwatchDef swatches[] = {
+            { "New DXCC", m_dxccProvider ? &m_dxccProvider->colorNewDxcc : nullptr, "DxccColorNewEntity" },
+            { "New Band",  m_dxccProvider ? &m_dxccProvider->colorNewBand  : nullptr, "DxccColorNewBand"   },
+            { "New Mode",  m_dxccProvider ? &m_dxccProvider->colorNewMode  : nullptr, "DxccColorNewMode"   },
+            { "Worked",    m_dxccProvider ? &m_dxccProvider->colorWorked   : nullptr, "DxccColorWorked"    },
+        };
+        for (const auto& sw : swatches) {
+            auto* col = new QVBoxLayout;
+            auto* lbl = new QLabel(sw.tip);
+            lbl->setAlignment(Qt::AlignCenter);
+            lbl->setStyleSheet("QLabel { color: #809090; font-size: 10px; }");
+            auto* btn = new QPushButton;
+            btn->setFixedSize(28, 22);
+            const QColor initCol = sw.colPtr ? *sw.colPtr : QColor(Qt::gray);
+            updateSwatch(btn, initCol);
+            const QString key = sw.key;
+            QColor* colPtr = sw.colPtr;
+            connect(btn, &QPushButton::clicked, this, [this, btn, key, colPtr, updateSwatch, save]() {
+                const QColor cur = colPtr ? *colPtr : QColor(Qt::gray);
+                QColor c = QColorDialog::getColor(cur, this, "Pick Colour");
+                if (!c.isValid()) return;
+                if (colPtr) *colPtr = c;
+                updateSwatch(btn, c);
+                save(key, c.name());
+            });
+            col->addWidget(lbl);
+            col->addWidget(btn, 0, Qt::AlignCenter);
+            swatchRow->addLayout(col);
+        }
+        swatchRow->addStretch();
+        dxccGrid->addWidget(new QLabel("Colors:"), drow, 0);
+        dxccGrid->addLayout(swatchRow, drow++, 1);
+
+        layout->addLayout(dxccGrid);
+
+        // Auto-reload toggle
+        bool autoReloadEnabled = AppSettings::instance().value("DxccAutoReloadAdif", "False").toString() == "True";
+        auto* autoReloadToggle = new QPushButton(autoReloadEnabled ? "Enabled" : "Disabled");
+        autoReloadToggle->setCheckable(true);
+        autoReloadToggle->setChecked(autoReloadEnabled);
+        autoReloadToggle->setFixedWidth(80);
+        autoReloadToggle->setStyleSheet(
+            "QPushButton:checked { background: #2a6a2a; } QPushButton:!checked { background: #5a2a2a; }");
+        connect(autoReloadToggle, &QPushButton::toggled, this, [this, autoReloadToggle, save](bool on) {
+            autoReloadToggle->setText(on ? "Enabled" : "Disabled");
+            save("DxccAutoReloadAdif", on ? "True" : "False");
+            if (m_dxccProvider) {
+                const QString path = AppSettings::instance().value("DxccAdifFilePath", "").toString();
+                m_dxccProvider->setAutoReload(on, path);
+            }
+        });
+        dxccGrid->addWidget(new QLabel("Auto-Reload Log:"), drow, 0);
+        dxccGrid->addWidget(autoReloadToggle, drow++, 1, Qt::AlignLeft);
+
+        // Wire browse button
+        connect(browseBtn, &QPushButton::clicked, this, [this, adifPathLabel, save](bool) {
+            const QString path = QFileDialog::getOpenFileName(
+                this, "Select ADIF Log File", QDir::homePath(),
+                "ADIF Log Files (*.adi *.adif);;All Files (*)");
+            if (path.isEmpty()) return;
+            adifPathLabel->setText(QFileInfo(path).fileName());
+            save("DxccAdifFilePath", path);
+            if (m_dxccProvider) {
+                if (m_dxccStatsLabel) m_dxccStatsLabel->setText("Importing\xe2\x80\xa6");
+                m_dxccProvider->importAdifFile(path);
+                const bool autoReload = AppSettings::instance().value("DxccAutoReloadAdif","False").toString() == "True";
+                m_dxccProvider->setAutoReload(autoReload, path);
+            }
+        });
+
+        // Update stats when import finishes
+        if (m_dxccProvider) {
+            connect(m_dxccProvider, &DxccColorProvider::importFinished,
+                    this, [this](int qsos, int entities) {
+                if (m_dxccStatsLabel)
+                    m_dxccStatsLabel->setText(
+                        QString("%1 QSOs / %2 entities").arg(qsos).arg(entities));
+            });
+        }
+    }
+
+    layout->addStretch();
+
+    // ── Clear All Spots button ──────────────────────────────────────────
+    auto* btnRow2 = new QHBoxLayout;
+    auto* clearAllBtn = new QPushButton("Clear All Spots");
+    clearAllBtn->setFixedWidth(120);
+    connect(clearAllBtn, &QPushButton::clicked, this, [this] {
+        m_radioModel->sendCommand("spot clear");
+        m_spotModel->clear();
+        if (m_totalSpotsLabel)
+            m_totalSpotsLabel->setText("0");
+        emit spotsClearedAll();
+        emit settingsChanged();
+    });
+    btnRow2->addWidget(clearAllBtn);
+    btnRow2->addStretch();
+    layout->addLayout(btnRow2);
+
+    tabs->addTab(page, "Display");
+}
+
+void DxClusterDialog::setTotalSpots(int count)
+{
+    if (m_totalSpotsLabel)
+        m_totalSpotsLabel->setText(QString::number(count));
+}
+
+void DxClusterDialog::selectTab(const QString& tabTitle)
+{
+    if (!m_tabs || tabTitle.trimmed().isEmpty())
+        return;
+
+    for (int i = 0; i < m_tabs->count(); ++i) {
+        if (m_tabs->tabText(i).compare(tabTitle, Qt::CaseInsensitive) == 0) {
+            m_tabs->setCurrentIndex(i);
+            return;
+        }
+    }
+}
+
+void DxClusterDialog::flushSpotBatch()
+{
+    if (m_spotBatch.isEmpty()) return;
+
+    auto isAtBottom = [](QAbstractScrollArea* w) {
+        auto* sb = w->verticalScrollBar();
+        return sb->value() >= sb->maximum() - 2;
+    };
+    bool follow = isAtBottom(m_spotTable);
+
+    m_spotModel->addSpots(m_spotBatch);
+    m_spotBatch.clear();
+
+    if (follow)
+        m_spotTable->scrollToBottom();
+}
+
+void DxClusterDialog::updateStatus()
+{
+    // Cluster status
+    if (m_client->isConnected()) {
+        m_statusLabel->setText(QString("Connected to %1:%2").arg(m_client->host()).arg(m_client->port()));
+        m_statusLabel->setStyleSheet("QLabel { color: #00b4d8; font-size: 11px; }");
+        m_connectBtn->setText("Disconnect");
+        m_cmdEdit->setEnabled(true);
+        m_sendBtn->setEnabled(true);
+    } else {
+        m_statusLabel->setText("Disconnected");
+        m_statusLabel->setStyleSheet("QLabel { color: #808080; font-size: 11px; }");
+        m_connectBtn->setText("Connect");
+        m_cmdEdit->setEnabled(false);
+        m_sendBtn->setEnabled(false);
+    }
+    // RBN status
+    if (m_rbnClient->isConnected()) {
+        m_rbnStatusLabel->setText(QString("Connected to %1:%2").arg(m_rbnClient->host()).arg(m_rbnClient->port()));
+        m_rbnStatusLabel->setStyleSheet("QLabel { color: #00b4d8; font-size: 11px; }");
+        m_rbnConnectBtn->setText("Disconnect");
+        m_rbnCmdEdit->setEnabled(true);
+        m_rbnSendBtn->setEnabled(true);
+    } else {
+        m_rbnStatusLabel->setText("Disconnected");
+        m_rbnStatusLabel->setStyleSheet("QLabel { color: #808080; font-size: 11px; }");
+        m_rbnConnectBtn->setText("Connect");
+        m_rbnCmdEdit->setEnabled(false);
+        m_rbnSendBtn->setEnabled(false);
+    }
+    // POTA status
+    if (m_potaClient->isPolling()) {
+        m_potaStatusLabel->setText("Polling...");
+        m_potaStatusLabel->setStyleSheet("QLabel { color: #00b4d8; font-size: 11px; }");
+        m_potaStartBtn->setText("Stop");
+    } else {
+        m_potaStatusLabel->setText("Stopped");
+        m_potaStatusLabel->setStyleSheet("QLabel { color: #808080; font-size: 11px; }");
+        m_potaStartBtn->setText("Start");
+    }
+}
+
+} // namespace AetherSDR

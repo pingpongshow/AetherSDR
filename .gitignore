@@ -1,0 +1,19 @@
+build/
+build-*/
+.cache/
+*.user
+.qtc_clangd/
+reference/
+docs/release_notes/
+build.ps1
+CMakeFiles/
+docs/logo-original.jpg
+docs/logo_upscayl.png
+# Local build/packaging output and OS/editor clutter
+dist-macos/
+deploy/
+deploy-*/
+*.log
+*.bak
+.DS_Store
+__pycache__/

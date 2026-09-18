@@ -1,0 +1,149 @@
+name: AppImage
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-appimage:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-22.04
+            arch: x86_64
+            use_aqt: true
+          - runner: ubuntu-24.04-arm
+            arch: aarch64
+            use_aqt: false
+
+    runs-on: ${{ matrix.runner }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y cmake ninja-build pkg-config \
+            libgl1-mesa-dev libxkbcommon-dev libxkbcommon-x11-0 \
+            libxcb-cursor0 libxcb-icccm4 libxcb-keysyms1 libxcb-shape0 \
+            libxcb-render-util0 libxcb-xinerama0 libxcb-randr0 libxcb-xfixes0 \
+            gstreamer1.0-plugins-base gstreamer1.0-plugins-good \
+            gstreamer1.0-pulseaudio gstreamer1.0-gl \
+            libgstreamer-gl1.0-0 libgstreamer-plugins-base1.0-0 \
+            libfuse2 file desktop-file-utils imagemagick \
+            python3-pip autoconf automake libtool libasound2-dev \
+            libfftw3-dev libhidapi-dev portaudio19-dev
+
+      - name: Install system Qt (ARM only)
+        if: matrix.use_aqt == false
+        run: |
+          sudo apt-get install -y qt6-base-dev qt6-multimedia-dev \
+            qt6-websockets-dev qt6-serialport-dev qt6-base-private-dev \
+            qt6-shader-baker qt6-shadertools-dev \
+            libhidapi-dev portaudio19-dev libfftw3-dev
+
+      - name: Install Qt 6.7 via aqtinstall (x86_64)
+        if: matrix.use_aqt == true
+        run: |
+          pip3 install aqtinstall
+          aqt install-qt linux desktop 6.7.3 linux_gcc_64 \
+            -m qtmultimedia qtwebsockets qtserialport qtshadertools \
+            --outputdir ${{ github.workspace }}/Qt
+          echo "Qt6_DIR=${{ github.workspace }}/Qt/6.7.3/gcc_64/lib/cmake/Qt6" >> $GITHUB_ENV
+          echo "CMAKE_PREFIX_PATH=${{ github.workspace }}/Qt/6.7.3/gcc_64" >> $GITHUB_ENV
+          echo "PATH=${{ github.workspace }}/Qt/6.7.3/gcc_64/bin:$PATH" >> $GITHUB_ENV
+          echo "LD_LIBRARY_PATH=${{ github.workspace }}/Qt/6.7.3/gcc_64/lib:$LD_LIBRARY_PATH" >> $GITHUB_ENV
+
+      - name: Setup DeepFilterNet3 (DFNR)
+        run: bash setup-deepfilter.sh
+
+      - name: Configure
+        run: |
+          CMAKE_EXTRA=""
+          if [ "${{ matrix.use_aqt }}" = "true" ]; then
+            CMAKE_EXTRA="-DCMAKE_PREFIX_PATH=${{ github.workspace }}/Qt/6.7.3/gcc_64"
+          fi
+          cmake -B build -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr \
+            -DREQUIRE_SERIALPORT=ON \
+            -DMQTT_TLS=OFF \
+            $CMAKE_EXTRA
+
+      - name: Build Opus (RADE dependency)
+        run: cmake --build build --target build_opus -j$(nproc)
+
+      - name: Build
+        run: cmake --build build -j$(nproc)
+
+      - name: Install to AppDir
+        run: |
+          DESTDIR=${{ github.workspace }}/AppDir cmake --install build
+          # Resize icon to 256x256 (source is 768x768)
+          convert AppDir/usr/share/icons/hicolor/256x256/apps/aethersdr.png \
+            -resize 256x256 AppDir/usr/share/icons/hicolor/256x256/apps/aethersdr.png
+
+          # Bundle DeepFilterNet3 model for DFNR
+          if [ -f third_party/deepfilter/models/DeepFilterNet3_onnx.tar.gz ]; then
+            cp third_party/deepfilter/models/DeepFilterNet3_onnx.tar.gz \
+              AppDir/usr/bin/
+          fi
+
+          # Bundle Qt6 multimedia backend plugin
+          if [ "${{ matrix.use_aqt }}" = "true" ]; then
+            QT_PLUGIN_PATH=${{ github.workspace }}/Qt/6.7.3/gcc_64/plugins
+          else
+            QT_PLUGIN_PATH=$(qmake6 -query QT_INSTALL_PLUGINS 2>/dev/null || echo "/usr/lib/$(uname -m)-linux-gnu/qt6/plugins")
+          fi
+          mkdir -p AppDir/usr/plugins/multimedia
+          cp -v "$QT_PLUGIN_PATH"/multimedia/* AppDir/usr/plugins/multimedia/ 2>/dev/null || true
+
+          # Bundle essential GStreamer plugins for audio
+          GST_PATH=$(pkg-config --variable=pluginsdir gstreamer-1.0 2>/dev/null || echo "/usr/lib/$(uname -m)-linux-gnu/gstreamer-1.0")
+          mkdir -p AppDir/usr/lib/gstreamer-1.0
+          for p in libgstpulseaudio.so libgstpipewiresrc.so libgstalsa.so libgstaudioconvert.so \
+                   libgstaudioresample.so libgstautodetect.so libgstcoreelements.so libgsttypefindfunctions.so; do
+            cp -v "$GST_PATH/$p" AppDir/usr/lib/gstreamer-1.0/ 2>/dev/null || true
+          done
+
+      - name: Download linuxdeploy + Qt plugin
+        run: |
+          wget -q https://github.com/linuxdeploy/linuxdeploy/releases/download/continuous/linuxdeploy-${{ matrix.arch }}.AppImage
+          wget -q https://github.com/linuxdeploy/linuxdeploy-plugin-qt/releases/download/continuous/linuxdeploy-plugin-qt-${{ matrix.arch }}.AppImage
+          chmod +x linuxdeploy-${{ matrix.arch }}.AppImage linuxdeploy-plugin-qt-${{ matrix.arch }}.AppImage
+
+      - name: Build AppImage
+        env:
+          LDAI_OUTPUT: AetherSDR-${{ github.ref_name }}-${{ matrix.arch }}.AppImage
+          QT_SELECT: qt6
+          EXTRA_QT_PLUGINS: multimedia
+        run: |
+          if [ "${{ matrix.use_aqt }}" = "true" ]; then
+            export QMAKE=${{ github.workspace }}/Qt/6.7.3/gcc_64/bin/qmake
+          else
+            export QMAKE=$(which qmake6 2>/dev/null || which qmake)
+          fi
+          ./linuxdeploy-${{ matrix.arch }}.AppImage \
+            --appdir AppDir \
+            --plugin qt \
+            --desktop-file AppDir/usr/share/applications/AetherSDR.desktop \
+            --icon-file AppDir/usr/share/icons/hicolor/256x256/apps/aethersdr.png \
+            --output appimage
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: AppImage-${{ matrix.arch }}
+          path: AetherSDR-*.AppImage
+
+      - name: Attach to release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v3
+        with:
+          files: AetherSDR-*.AppImage

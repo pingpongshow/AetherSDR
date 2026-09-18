@@ -1,0 +1,9 @@
+[Desktop Entry]
+Name=AetherSDR
+Comment=Linux-native SDR client for FlexRadio
+Exec=AetherSDR
+Icon=aethersdr
+Type=Application
+Categories=HamRadio;Audio;
+Terminal=false
+StartupWMClass=AetherSDR

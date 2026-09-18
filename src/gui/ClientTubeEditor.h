@@ -1,0 +1,93 @@
+#pragma once
+
+#include "core/ClientChainStages.h"
+
+#include <QWidget>
+
+class QPushButton;
+class QButtonGroup;
+class QTimer;
+
+namespace AetherSDR {
+
+class AudioEngine;
+class ClientTube;
+class ClientCompKnob;         // reused — generic rotary knob
+class ClientTubeCurveWidget;
+
+// Floating editor for the client-side dynamic tube saturator.
+// Layout mirrors Ableton's Dynamic Tube device:
+//
+//   ┌─ bypass ──────────────────── × ┐
+//   │ ┌──────┐ ┌─────────┐ ┌──────┐ │
+//   │ │DryWet│ │  curve  │ │ ENV  │ │
+//   │ │      │ │         │ │      │ │
+//   │ │ Out  │ │         │ │ ATK  │ │
+//   │ │      │ │ [A B C] │ │      │ │
+//   │ │Drive │ │  Tone   │ │ REL  │ │
+//   │ │      │ │  Bias   │ │      │ │
+//   │ └──────┘ └─────────┘ └──────┘ │
+//   └────────────────────────────────┘
+class ClientTubeEditor : public QWidget {
+    Q_OBJECT
+
+public:
+    explicit ClientTubeEditor(AudioEngine* engine, QWidget* parent = nullptr);
+    ~ClientTubeEditor() override;
+
+    void showForTx();
+    // Rebinds the editor to the RX-chain instance and raises it.
+    void showForRx();
+    void showForPath(ClientChainPath path);
+    ClientChainPath path() const { return m_path; }
+
+signals:
+    void bypassToggled(bool bypassed);
+
+protected:
+    void closeEvent(QCloseEvent* ev) override;
+    void moveEvent(QMoveEvent* ev) override;
+    void resizeEvent(QResizeEvent* ev) override;
+    void showEvent(QShowEvent* ev) override;
+    void hideEvent(QHideEvent* ev) override;
+
+private:
+    void saveGeometryToSettings();
+    void restoreGeometryFromSettings();
+    void syncControlsFromEngine();
+
+    void applyModel(int idx);   // 0=A, 1=B, 2=C
+    void applyDrive(float db);
+    void applyBias(float v);
+    void applyTone(float v);
+    void applyOutput(float db);
+    void applyDryWet(float v);
+    void applyEnvelope(float v);
+    void applyAttack(float ms);
+    void applyRelease(float ms);
+
+    // DSP instance for the currently bound chain path (TX or RX).
+    ClientTube* dsp() const;
+
+    AudioEngine*           m_audio{nullptr};
+    ClientChainPath m_path{ClientChainPath::Tx};
+    QString         m_baseTitle;
+    ClientTubeCurveWidget* m_curve{nullptr};
+    ClientCompKnob*        m_dryWet{nullptr};
+    ClientCompKnob*        m_output{nullptr};
+    ClientCompKnob*        m_drive{nullptr};
+    ClientCompKnob*        m_tone{nullptr};
+    ClientCompKnob*        m_bias{nullptr};
+    ClientCompKnob*        m_envelope{nullptr};
+    ClientCompKnob*        m_attack{nullptr};
+    ClientCompKnob*        m_release{nullptr};
+    QPushButton*           m_modelA{nullptr};
+    QPushButton*           m_modelB{nullptr};
+    QPushButton*           m_modelC{nullptr};
+    QButtonGroup*          m_modelGroup{nullptr};
+    QPushButton*           m_bypass{nullptr};
+    QTimer*                m_syncTimer{nullptr};   // mirror engine → knobs
+    bool                   m_restoring{false};
+};
+
+} // namespace AetherSDR
