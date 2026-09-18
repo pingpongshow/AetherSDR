@@ -10,7 +10,7 @@ jobs:
     container: ghcr.io/ten9876/aethersdr-ci:latest
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Setup DeepFilterNet3 (DFNR)
         run: bash setup-deepfilter.sh
@@ -38,7 +38,7 @@ jobs:
     container: ghcr.io/ten9876/aethersdr-ci:latest
 
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Configure (ASan + UBSan)
         run: cmake -B build-asan -G Ninja -DCMAKE_BUILD_TYPE=RelWithDebInfo -DENABLE_ASAN=ON
@@ -67,7 +67,7 @@ jobs:
     outputs:
       build-changed: ${{ steps.filter.outputs.build }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dorny/paths-filter@v4
         id: filter
         with:
@@ -84,7 +84,7 @@ jobs:
     if: needs.check-paths.outputs.build-changed == 'true'
     runs-on: windows-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
 
       - name: Install Qt
         uses: jurplel/install-qt-action@v4
