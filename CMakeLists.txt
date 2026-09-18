@@ -1,5 +1,22 @@
 cmake_minimum_required(VERSION 3.20)
-project(AetherSDR VERSION 0.9.0 LANGUAGES C CXX Fortran)
+project(AetherSDR VERSION 0.9.0 LANGUAGES C CXX)
+
+# Native JT65/WSPR codecs are WSJT-X Fortran. Fortran is optional: MSVC has no
+# ABI-compatible free Fortran compiler (MinGW gfortran can't link with it), so
+# Windows builds use C stubs and those two modes report "unavailable".
+option(ENABLE_WSJT_NATIVE "Build native JT65/WSPR codecs (requires Fortran)" ON)
+set(WSJT_NATIVE_FOUND FALSE)
+if(ENABLE_WSJT_NATIVE AND NOT MSVC)
+    include(CheckLanguage)
+    check_language(Fortran)
+    if(CMAKE_Fortran_COMPILER)
+        enable_language(Fortran)
+        set(WSJT_NATIVE_FOUND TRUE)
+    endif()
+endif()
+if(NOT WSJT_NATIVE_FOUND)
+    message(STATUS "Native JT65/WSPR codecs disabled (no compatible Fortran compiler)")
+endif()
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -464,6 +481,12 @@ set(WSJT_NATIVE_WSPR_SOURCES
 )
 set_source_files_properties(${WSJT_NATIVE_WSPR_SOURCES} PROPERTIES COMPILE_FLAGS "-w")
 
+if(WSJT_NATIVE_FOUND)
+    set(WSJT_NATIVE_SOURCES ${WSJT_NATIVE_JT65_SOURCES} ${WSJT_NATIVE_WSPR_SOURCES})
+else()
+    set(WSJT_NATIVE_SOURCES third_party/wsjt_native/stubs/wsjt_native_stubs.c)
+endif()
+
 set(CORE_SOURCES
     src/core/AppSettings.cpp
     src/core/BandStackSettings.cpp
@@ -569,8 +592,7 @@ set(CORE_SOURCES
     src/core/SleepInhibitor.cpp
     src/core/MemoryCsvCompat.cpp
     ${FT8_LIB_SOURCES}
-    ${WSJT_NATIVE_JT65_SOURCES}
-    ${WSJT_NATIVE_WSPR_SOURCES}
+    ${WSJT_NATIVE_SOURCES}
     third_party/ssdv/ssdv.c
     third_party/ssdv/rs8.c
 )
