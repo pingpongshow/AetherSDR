@@ -81,6 +81,10 @@ void DigitalVoiceController::updateForMox(bool tx)
 
 bool DigitalVoiceController::deferUnkeyForEndOfOver(std::function<void()> unkey)
 {
+#ifndef HAVE_RADE
+    Q_UNUSED(unkey);
+    return false;   // EOO callsign frames are RADE-only
+#else
     const auto* dvSlice = m_mw.m_radioModel.slice(m_dvSliceId);
     if (!digitalVoiceActive() || m_dvMode != DigitalVoiceMode::RadeV1
         || !dvSlice || !dvSlice->isTxSlice()) {
@@ -106,6 +110,7 @@ bool DigitalVoiceController::deferUnkeyForEndOfOver(std::function<void()> unkey)
     QMetaObject::invokeMethod(m_dvEngine, &DigitalVoiceEngine::requestEndOfOver,
                               Qt::QueuedConnection);
     return true;
+#endif
 }
 
 void DigitalVoiceController::shutdownDigitalVoice()

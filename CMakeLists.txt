@@ -445,6 +445,14 @@ set(FT8_LIB_SOURCES
     third_party/ft8_lib/ft8/message.c
     third_party/ft8_lib/ft8/text.c
 )
+# ft8_lib's monitor uses KISS FFT. RADE bundles the same functions, so only
+# compile ft8_lib's copy when RADE is off (e.g. Windows) to avoid duplicates.
+if(NOT RADE_FOUND)
+    list(APPEND FT8_LIB_SOURCES
+        third_party/ft8_lib/fft/kiss_fft.c
+        third_party/ft8_lib/fft/kiss_fftr.c
+    )
+endif()
 set_source_files_properties(${FT8_LIB_SOURCES} PROPERTIES COMPILE_FLAGS "-w")
 
 set(WSJT_NATIVE_JT65_SOURCES
