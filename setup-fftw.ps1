@@ -63,16 +63,30 @@ Copy-Item "$tempDir\libfftw3f-3.def" "$OutDir\lib\" -ErrorAction SilentlyContinu
 # ── Import MSVC environment and generate .lib ────────────────────────────
 Write-Host "Generating MSVC import library..." -ForegroundColor Cyan
 
-if (-not (Test-Path $VsVars)) {
-    Write-Error "Visual Studio 2022 not found at: $VsVars"
-    exit 1
-}
+# Use lib.exe from PATH when an MSVC environment is already active (e.g.
+# ilammy/msvc-dev-cmd in CI); otherwise locate any Visual Studio install
+# via vswhere (hard-coded VS 2022 paths break on newer runner images).
+if (-not (Get-Command lib.exe -ErrorAction SilentlyContinue)) {
+    if (-not (Test-Path $VsVars)) {
+        $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+        if (Test-Path $vswhere) {
+            $vsPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
+            if ($vsPath) {
+                $VsVars = Join-Path $vsPath "VC\Auxiliary\Build\vcvars64.bat"
+            }
+        }
+    }
+    if (-not (Test-Path $VsVars)) {
+        Write-Error "Visual Studio (MSVC x64 tools) not found"
+        exit 1
+    }
 
-# Import MSVC env
-$envVars = & cmd.exe /c "`"$VsVars`" >nul 2>&1 && set" 2>&1
-foreach ($line in $envVars) {
-    if ($line -match "^([^=]+)=(.*)$") {
-        [System.Environment]::SetEnvironmentVariable($matches[1], $matches[2], "Process")
+    # Import MSVC env
+    $envVars = & cmd.exe /c "`"$VsVars`" >nul 2>&1 && set" 2>&1
+    foreach ($line in $envVars) {
+        if ($line -match "^([^=]+)=(.*)$") {
+            [System.Environment]::SetEnvironmentVariable($matches[1], $matches[2], "Process")
+        }
     }
 }
 
