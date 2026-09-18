@@ -11,6 +11,10 @@ permissions:
 jobs:
   build-windows:
     runs-on: windows-latest
+    env:
+      # windows-latest ships CMake 4, which rejects third-party projects that
+      # declare cmake_minimum_required < 3.5 (e.g. hidapi 0.14).
+      CMAKE_POLICY_VERSION_MINIMUM: '3.5'
 
     steps:
       - uses: actions/checkout@v6
