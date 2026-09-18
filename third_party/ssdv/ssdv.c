@@ -19,6 +19,11 @@
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+#ifdef _MSC_VER
+/* ssize_t is POSIX; MSVC provides SSIZE_T in BaseTsd.h */
+#include <BaseTsd.h>
+typedef SSIZE_T ssize_t;
+#endif
 #include "ssdv.h"
 #include "rs8.h"
 
