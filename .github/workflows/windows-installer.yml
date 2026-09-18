@@ -47,7 +47,7 @@ jobs:
           cmake -B build -G "Ninja" -DCMAKE_BUILD_TYPE=Release -DENABLE_RADE=OFF -DMQTT_TLS=OFF
 
       - name: Build
-        run: cmake --build build -j $env:NUMBER_OF_PROCESSORS
+        run: cmake --build build --target AetherSDR -j $env:NUMBER_OF_PROCESSORS
 
       - name: Deploy Qt
         run: |
